@@ -27,7 +27,7 @@ next steps:
 
 ### new game progress
 
-**`████░░` 4 of 6 milestones verified**
+![new game progress. Four of six milestones verified. Loading artwork renders. Next milestone is the first playable scene.](docs/assets/new-game-progress.svg)
 
 | Milestone | Status |
 |---|---|

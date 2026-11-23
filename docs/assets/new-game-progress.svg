@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="760" height="216" viewBox="0 0 760 216" role="img" aria-labelledby="title description">
+  <title id="title">new game compatibility progress</title>
+  <desc id="description">Four of six milestones verified. Loading artwork renders. The next milestone is the first playable scene.</desc>
+
+  <defs>
+    <linearGradient id="surface" x1="0" y1="1" x2="1" y2="0">
+      <stop stop-color="#141622"/>
+      <stop offset="1" stop-color="#211b35"/>
+    </linearGradient>
+    <linearGradient id="progress" gradientUnits="userSpaceOnUse" x1="32" x2="493.33">
+      <stop stop-color="#78cbf3"/>
+      <stop offset=".55" stop-color="#9ea6ff"/>
+      <stop offset="1" stop-color="#c9a2f8"/>
+    </linearGradient>
+  </defs>
+
+  <rect x=".5" y=".5" width="759" height="215" rx="22" fill="url(#surface)" stroke="#514668"/>
+
+  <g font-family="system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif">
+    <text x="32" y="42" fill="#b8aec9" font-size="13" font-weight="650" letter-spacing="2">COMPATIBILITY PROGRESS</text>
+    <text x="30" y="85" fill="#f6f2ff" font-size="43" font-weight="750" letter-spacing="-1.8">new game</text>
+
+    <text x="728" y="65" text-anchor="end" font-size="38" font-weight="750" letter-spacing="-1.3">
+      <tspan fill="#d5baff">4</tspan><tspan fill="#a9a0b9"> / 6</tspan>
+    </text>
+    <text x="728" y="87" text-anchor="end" fill="#c4bbd3" font-size="15">milestones verified</text>
+
+    <g fill="url(#progress)">
+      <rect x="32" y="113" width="109.33" height="14" rx="7"/>
+      <rect x="149.33" y="113" width="109.33" height="14" rx="7"/>
+      <rect x="266.67" y="113" width="109.33" height="14" rx="7"/>
+      <rect x="384" y="113" width="109.33" height="14" rx="7"/>
+    </g>
+    <g fill="#302842" stroke="#524664">
+      <rect x="501.33" y="113" width="109.33" height="14" rx="7"/>
+      <rect x="618.67" y="113" width="109.33" height="14" rx="7"/>
+    </g>
+
+    <path d="M32 149H728" stroke="#40374f"/>
+    <text x="32" y="172" fill="#9fb9f5" font-size="11" font-weight="700" letter-spacing="1.5">LATEST VERIFIED</text>
+    <text x="32" y="193" fill="#ede8f8" font-size="18" font-weight="600">Loading artwork</text>
+    <text x="728" y="172" text-anchor="end" fill="#cfb3f9" font-size="11" font-weight="700" letter-spacing="1.5">NEXT MILESTONE</text>
+    <text x="728" y="193" text-anchor="end" fill="#ede8f8" font-size="18" font-weight="600">First playable scene</text>
+  </g>
+</svg>
