@@ -156,6 +156,65 @@ pub fn in_graphics_reservation(p: usize) -> bool {
 
 const MEM_WRITE_WATCH: u32 = 0x20_0000;
 
+/// GPU views of the title's CPU memory. A retail game reserves 24 GB of 64 KiB pages twice
+/// in a row: once readable by the CPU (PAGE_READWRITE), once with PAGE_NOACCESS |
+/// PAGE_GRAPHICS_NOACCESS. It maps physical pages only into the first, yet places GPU
+/// resources at the same offset in the second (its Bink video planes: the decoder writes the
+/// first view, the video shader samples textures in the second). On the console the second
+/// reservation is a GPU-only view of the first; here it is separate, empty memory – the
+/// video was its colour of zero luma and chroma, a green screen. `source` names the CPU view
+/// behind an address of such a GPU view, which `d3d12x::title_textures` reads and watches.
+pub mod mirrors {
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+
+    /// MEM_LARGE_PAGES | MEM_PHYSICAL: the console's 64 KiB pages
+    const PAGES_64K: u32 = 0x2040_0000;
+    /// PAGE_GRAPHICS_NOACCESS
+    const GRAPHICS_NOACCESS: u32 = 0x800;
+
+    struct State {
+        /// CPU-readable reservations of 64 KiB pages, oldest first: (base, size)
+        cpu: Vec<(usize, usize)>,
+        /// GPU view base → (size, CPU view base)
+        gpu: BTreeMap<usize, (usize, usize)>,
+    }
+    static STATE: Mutex<State> = Mutex::new(State { cpu: Vec::new(), gpu: BTreeMap::new() });
+
+    /// A reservation of `size` bytes at `base` with allocation type `t` and protection `p`.
+    pub fn reserved(base: usize, size: usize, t: u32, p: u32) {
+        if t & PAGES_64K != PAGES_64K || t & 0x1000 != 0 {
+            return;
+        }
+        let mut s = STATE.lock().unwrap();
+        if p & GRAPHICS_NOACCESS != 0 && p & 0xFF == super::mem::PAGE_NOACCESS {
+            // the most recent CPU view of the same size without a GPU view yet
+            let taken: Vec<usize> = s.gpu.values().map(|&(_, c)| c).collect();
+            if let Some(&(cpu, _)) = s.cpu.iter().rev().find(|&&(b, n)| n == size && !taken.contains(&b)) {
+                s.gpu.insert(base, (size, cpu));
+                crate::xlog_info!("kernelx: reservation {base:#x} ({size:#x} bytes, no CPU access) is the GPU view of {cpu:#x}");
+            }
+        } else if p & 0xFF != super::mem::PAGE_NOACCESS {
+            s.cpu.push((base, size));
+        }
+    }
+
+    /// The reservation at `base` was released.
+    pub fn released(base: usize) {
+        let mut s = STATE.lock().unwrap();
+        s.cpu.retain(|&(b, _)| b != base);
+        s.gpu.remove(&base);
+        s.gpu.retain(|_, &mut (_, c)| c != base);
+    }
+
+    /// The CPU-view address behind `va` when `va` lies in a GPU view.
+    pub fn source(va: usize) -> Option<usize> {
+        let s = STATE.lock().unwrap();
+        let (&gpu, &(size, cpu)) = s.gpu.range(..=va).next_back()?;
+        (va < gpu + size).then(|| cpu + (va - gpu))
+    }
+}
+
 /// Graphics memory (MEM_GRAPHICS, committed, no fixed address) comes from the unified
 /// memory region the GPU uses directly (`gpu::uma`); a graphics reservation (no commit) is
 /// write-watched address space of Windows; everything else from Windows.
@@ -260,6 +319,22 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t: 
             }
         }
     }
+    // GPU-visible title memory the windows above had no room for (a retail game: a 24 GB
+    // reservation of 64 KiB pages, 2.2 GB of large pages with a graphics protection) is plain
+    // memory here. Textures the title places in it are kept in step with it
+    // (`d3d12x::title_textures`), which needs its CPU writes to be seen: it is write-watched
+    // like a graphics reservation. Without that such a texture was uploaded once, empty, and
+    // never again (the game's glyph atlas: its menus lost their x-height letters).
+    if addr.is_null() && t & 0x2000 != 0 && (t & (MEM_GRAPHICS | 0x2000_0000) != 0 || p & PAGE_GRAPHICS_ANY != 0) {
+        let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+        if !q.is_null() {
+            GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+            GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+            mirrors::reserved(q as usize, size, t, p);
+            trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
+            return q;
+        }
+    }
     let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
     q
@@ -353,6 +428,7 @@ pub unsafe extern "system" fn VirtualFree(addr: *mut c_void, size: usize, t: u32
     let ok = mem::VirtualFree(addr, size, t);
     if ok != 0 && t & 0x8000 != 0 && GRAPHICS_RESERVATIONS.lock().unwrap().remove(&(addr as usize)).is_some() {
         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+        mirrors::released(addr as usize);
     }
     ok
 }
@@ -862,7 +938,7 @@ unsafe fn commit_homes(home: usize, n: usize) -> bool {
         return true;
     }
     let len = n * PHYS_PAGE;
-    if (0..n).all(|i| committed_page(home + i * PHYS_PAGE)) {
+    if committed_range(home, len) {
         return true;
     }
     if mem::VirtualAlloc(home as *const c_void, len, mem::MEM_COMMIT, mem::PAGE_READWRITE).is_null() {
@@ -875,13 +951,37 @@ unsafe fn commit_homes(home: usize, n: usize) -> bool {
     true
 }
 
+/// Whether all of `[a, a + len)` is committed: one VirtualQuery per run of pages in one state
+/// (page by page each asked walked the rest of the run).
+fn committed_range(a: usize, len: usize) -> bool {
+    let mut p = a;
+    while p < a + len {
+        let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { mem::VirtualQuery(p as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 || m.State != mem::MEM_COMMIT {
+            return false;
+        }
+        p = m.BaseAddress as usize + m.RegionSize;
+    }
+    true
+}
+
 fn committed_page(a: usize) -> bool {
+    // A page in the working set is committed: asking for that is one entry, where VirtualQuery
+    // walks the page table to the end of the committed range the page is in (gigabytes of
+    // homes: 0.25 ms a page, and a scatter of pages from their homes grew with its square).
+    let mut ws = windows_sys::Win32::System::ProcessStatus::PSAPI_WORKING_SET_EX_INFORMATION { VirtualAddress: a as *mut c_void, ..Default::default() };
+    if unsafe { windows_sys::Win32::System::ProcessStatus::K32QueryWorkingSetEx(thr::GetCurrentProcess(), &mut ws as *mut _ as *mut c_void, std::mem::size_of_val(&ws) as u32) } != 0
+        && unsafe { ws.VirtualAttributes.Flags } & 1 != 0
+    {
+        return true;
+    }
     let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
     unsafe { mem::VirtualQuery(a as *const c_void, &mut m, std::mem::size_of_val(&m)) != 0 && m.State == mem::MEM_COMMIT }
 }
 
-/// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted).
-unsafe fn unmap_away(away: &mut Away, at: usize) {
+/// Copy what is mapped at `at` back home and unmap it (Windows memory is decommitted); the homes
+/// in `committed` the caller has committed.
+unsafe fn unmap_away(away: &mut Away, at: usize, committed: &std::ops::Range<usize>) {
     if let Some(page) = away.at.remove(&at) {
         away.page.remove(&page);
         // never used where it was mapped: its home still holds the page (zeros)
@@ -889,13 +989,15 @@ unsafe fn unmap_away(away: &mut Away, at: usize) {
             return;
         }
         // (a home this call has not given back yet is still committed)
+        let own = page_home(page);
         let pending = away.gone.len();
-        away.gone.retain(|&h| Some(h) != page_home(page));
-        let home = if away.gone.len() < pending { page_home(page) } else { page_home(page).and_then(|h| home_again(h)) };
+        away.gone.retain(|&h| Some(h) != own);
+        let home = if away.gone.len() < pending || own.is_some_and(|h| committed.contains(&h)) { own } else { own.and_then(|h| home_again(h)) };
         if let Some(home) = home {
             std::ptr::copy_nonoverlapping(at as *const u8, home as *mut u8, PHYS_PAGE);
         }
-        if !crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
+        // (an address among the homes the caller maps back is one of them: it stays)
+        if !committed.contains(&at) && !crate::gpu::uma::get().is_some_and(|u| u.is_committed(at)) {
             if crate::gpu::uma::get().is_some_and(|u| u.is_sparse(at)) {
                 crate::hle::d3d12x::sparse::decommitted(at, PHYS_PAGE);
             }
@@ -921,10 +1023,18 @@ pub unsafe extern "system" fn AllocateTitlePhysicalPages(_p: HANDLE, _t: u32, nu
     // (a sparse or plain home is committed when it is used: `home_again`); without room in
     // unified memory plain memory (pages mapped into the title's own reservations never use
     // their home: a retail game's 6.1 GB of them did not fit next to its GPU heaps)
-    let block = u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize)).or_else(|| {
+    static CPU_HOMES: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let cpu_home = bytes >= 256 << 20
+        && *CPU_HOMES.get_or_init(|| std::env::var("XCL_PHYSICAL_CPU_HOMES").is_ok_and(|v| v == "1"));
+    let block = if cpu_home {
+        None
+    } else {
+        u.sparse_alloc(bytes, PHYS_PAGE).map(|(p, _)| p).or_else(|| u.alloc(bytes, PHYS_PAGE).map(|p| p as usize))
+    };
+    let block = block.or_else(|| {
         let p = mem::VirtualAlloc(std::ptr::null(), bytes, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
         static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| crate::xlog_info!("AllocateTitlePhysicalPages({n}): no room in unified memory – their home is plain memory"));
+        ONCE.call_once(|| crate::xlog_info!("AllocateTitlePhysicalPages({n}): physical page homes reserved in CPU memory at {p:#x}"));
         (p != 0).then_some(p)
     });
     let Some(block) = block else {
@@ -1014,7 +1124,7 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
         away.gone.retain(|&h| h < home || h >= home + n * PHYS_PAGE);
         for &p in &pages {
             if let Some(&at) = away.page.get(&p) {
-                unmap_away(away, at);
+                unmap_away(away, at, &(home..home + n * PHYS_PAGE));
             }
         }
         return home as *mut c_void;
@@ -1027,12 +1137,12 @@ unsafe fn map_pages(away: &mut Away, va: *mut c_void, n: usize, arr: *mut usize)
     let in_uma = |a: usize| crate::gpu::uma::get().is_some_and(|u| u.is_committed(a));
     for (i, &p) in pages.iter().enumerate() {
         let at = base + i * PHYS_PAGE;
-        unmap_away(away, at);
+        unmap_away(away, at, &(0..0));
         if p == 0 {
             continue;
         }
         if let Some(&old) = away.page.get(&p) {
-            unmap_away(away, old);
+            unmap_away(away, old, &(0..0));
         }
         let fresh = !in_uma(at) && !committed_page(at);
         let home = page_home(p).unwrap();
@@ -1863,6 +1973,206 @@ mod tests {
         }
     }
 
+    /// `XMemMapPhysicalPagesScatter` against a model of physical pages: random scatters of
+    /// pages to addresses (page 0: unmap), writes through the addresses and maps of the whole
+    /// allocation at its home. After each step every page reads what was last written to it
+    /// wherever it is mapped, a page never written reads zeros, and an address with no page is
+    /// not committed.
+    #[test]
+    fn scatter_matches_a_model_of_physical_pages() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            const PAGES: usize = 24;
+            const SLOTS: usize = 32;
+            for seed in 1..=4u64 {
+                let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                let mut next = move || {
+                    x ^= x >> 12;
+                    x ^= x << 25;
+                    x ^= x >> 27;
+                    x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+                };
+                let mut n = PAGES;
+                let mut pages = [0usize; PAGES];
+                assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+                let r = mem::VirtualAlloc(std::ptr::null(), SLOTS * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+                assert!(r != 0);
+                let slot = |s: usize| r + s * PHYS_PAGE;
+                // model: what each page holds (first and last dword), where it is (None: home)
+                let mut value = [(0u32, 0u32); PAGES];
+                let mut at: [Option<usize>; PAGES] = [None; PAGES];
+                let mut held: [Option<usize>; SLOTS] = [None; SLOTS];
+                let mut home: Option<usize> = None;
+                let read = |a: usize| ((a as *const u32).read_volatile(), ((a + PHYS_PAGE - 4) as *const u32).read_volatile());
+                for step in 0..600 {
+                    match next() % 8 {
+                        // a scatter of 1–4 (slot, page or none)
+                        0..=3 => {
+                            let k = 1 + (next() % 4) as usize;
+                            let mut addrs = Vec::new();
+                            let mut ids = Vec::new();
+                            for _ in 0..k {
+                                let s = (next() % SLOTS as u64) as usize;
+                                let p = if next() % 5 == 0 { None } else { Some((next() % PAGES as u64) as usize) };
+                                addrs.push(slot(s) as *mut c_void);
+                                ids.push(p.map_or(0, |p| pages[p] as u64));
+                                // model, in call order: what the slot held goes home; the page leaves
+                                // where it was
+                                if let Some(q) = held[s].take() {
+                                    at[q] = None;
+                                }
+                                if let Some(p) = p {
+                                    if let Some(old) = at[p].take() {
+                                        held[old] = None;
+                                    }
+                                    at[p] = Some(s);
+                                    held[s] = Some(p);
+                                }
+                            }
+                            assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), k, ids.as_mut_ptr()), 1, "seed {seed} step {step}");
+                        }
+                        // a write through a mapped slot
+                        4..=6 => {
+                            let s = (next() % SLOTS as u64) as usize;
+                            if let Some(p) = held[s] {
+                                let v = ((next() as u32) | 1, (next() as u32) | 1);
+                                (slot(s) as *mut u32).write_volatile(v.0);
+                                ((slot(s) + PHYS_PAGE - 4) as *mut u32).write_volatile(v.1);
+                                value[p] = v;
+                            }
+                        }
+                        // the whole allocation at its home: every page leaves its slot
+                        _ => {
+                            let h = MapTitlePhysicalPages(std::ptr::null_mut(), PAGES, 0, 4, pages.as_mut_ptr()) as usize;
+                            assert!(h != 0);
+                            home = Some(h);
+                            at = [None; PAGES];
+                            held = [None; SLOTS];
+                            for (p, &v) in value.iter().enumerate() {
+                                assert_eq!(read(h + p * PHYS_PAGE), v, "seed {seed} step {step}: page {p} at home");
+                            }
+                        }
+                    }
+                    for s in 0..SLOTS {
+                        match held[s] {
+                            Some(p) => assert_eq!(read(slot(s)), value[p], "seed {seed} step {step}: page {p} at slot {s}"),
+                            None => assert!(!committed_page(slot(s)), "seed {seed} step {step}: slot {s} has no page but is committed"),
+                        }
+                    }
+                }
+                let _ = home;
+                assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), PAGES, pages.as_mut_ptr()), 1);
+                mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            }
+        }
+    }
+
+    /// A home a page went back to in a call, then decommitted in the same call because another
+    /// page was mapped at that address and unmapped again, is not taken as committed: mapping
+    /// its page away does not read decommitted memory.
+    #[test]
+    fn a_home_decommitted_in_the_same_call_is_asked_again() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let (p, q) = (pages[0], pages[1]);
+            let h = page_home(p).unwrap();
+            let r = mem::VirtualAlloc(std::ptr::null(), 2 * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let (s, t) = (r as *mut c_void, (r + PHYS_PAGE) as *mut c_void);
+            let mut one = [p as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(&s, 1, one.as_mut_ptr()), 1);
+            *(s as *mut u32) = 7;
+            // one call: p home (h holds it), q at h, h unmapped (decommitted), p to t
+            let at = [s, h as *mut c_void, h as *mut c_void, t];
+            let mut ids = [0, q as u64, 0, p as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(at.as_ptr(), 4, ids.as_mut_ptr()), 1);
+            // (t reads: committed, or committed on first use)
+            let _ = (t as *const u32).read_volatile();
+            assert!(!committed_page(s as usize));
+            let mut none = [0u64, 0];
+            let both = [s, t];
+            assert_eq!(XMemMapPhysicalPagesScatter(both.as_ptr(), 2, none.as_mut_ptr()), 1);
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// A page mapped at another page's home, then the whole allocation mapped back home: the
+    /// first page goes home and leaves that address committed, as the second one's home.
+    #[test]
+    fn a_page_away_at_another_home_goes_home_with_it() {
+        unsafe {
+            let Some(_) = crate::gpu::uma::get() else { return };
+            let mut n = 2usize;
+            let mut pages = [0usize; 2];
+            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut n, pages.as_mut_ptr()), 1);
+            let (q, p) = (pages[0], pages[1]);
+            let h = page_home(p).unwrap();
+            let r = mem::VirtualAlloc(std::ptr::null(), PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+            let s = r as *mut c_void;
+            let mut one = [p as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(&s, 1, one.as_mut_ptr()), 1);
+            *(s as *mut u32) = 7;
+            let at = h as *mut c_void;
+            let mut one = [q as u64];
+            assert_eq!(XMemMapPhysicalPagesScatter(&at, 1, one.as_mut_ptr()), 1);
+            *(h as *mut u32) = 9;
+            let home = MapTitlePhysicalPages(std::ptr::null_mut(), 2, 0, 4, pages.as_mut_ptr()) as usize;
+            assert_eq!(home, page_home(q).unwrap());
+            assert_eq!(*(home as *const u32), 9);
+            assert_eq!(*(h as *const u32), 7);
+            assert!(!committed_page(r));
+            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
+            mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+        }
+    }
+
+    /// Timing (`--ignored --nocapture`; `XCL_SCATTER_PAGES=4096,8192`): pages written at their
+    /// home, scattered from there into a reservation in one call, scattered again in reverse,
+    /// and mapped back home.
+    #[test]
+    #[ignore]
+    fn scatter_timing() {
+        let sizes: Vec<usize> = std::env::var("XCL_SCATTER_PAGES").ok().map_or(vec![4096, 8192, 16384], |v| v.split(',').map(|s| s.parse().unwrap()).collect());
+        let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1e3;
+        for n in sizes {
+            unsafe {
+                let mut cnt = n;
+                let mut pages = vec![0usize; n];
+                assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut cnt, pages.as_mut_ptr()), 1);
+                let h = MapTitlePhysicalPages(std::ptr::null_mut(), n, 0, 4, pages.as_mut_ptr()) as usize;
+                assert!(h != 0);
+                for i in 0..n {
+                    *((h + i * PHYS_PAGE) as *mut u32) = i as u32 + 1;
+                }
+                let r = mem::VirtualAlloc(std::ptr::null(), n * PHYS_PAGE, mem::MEM_RESERVE, mem::PAGE_READWRITE) as usize;
+                let addrs: Vec<*mut c_void> = (0..n).map(|i| (r + i * PHYS_PAGE) as *mut c_void).collect();
+                let mut ids: Vec<u64> = pages.iter().map(|&p| p as u64).collect();
+                let t = std::time::Instant::now();
+                assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), n, ids.as_mut_ptr()), 1);
+                let from_home = ms(t);
+                ids.reverse();
+                let t = std::time::Instant::now();
+                assert_eq!(XMemMapPhysicalPagesScatter(addrs.as_ptr(), n, ids.as_mut_ptr()), 1);
+                let reverse = ms(t);
+                for i in (0..n).step_by(97) {
+                    assert_eq!(*((r + i * PHYS_PAGE) as *const u32), (n - i) as u32);
+                }
+                let t = std::time::Instant::now();
+                assert_eq!(MapTitlePhysicalPages(std::ptr::null_mut(), n, 0, 4, pages.as_mut_ptr()) as usize, h);
+                let back = ms(t);
+                for i in (0..n).step_by(97) {
+                    assert_eq!(*((h + i * PHYS_PAGE) as *const u32), i as u32 + 1);
+                }
+                eprintln!("scatter_timing pages={n} from_home={from_home:.1}ms reverse={reverse:.1}ms back_home={back:.1}ms");
+                FreeTitlePhysicalPages(std::ptr::null_mut(), n, pages.as_mut_ptr());
+                mem::VirtualFree(r as *mut c_void, 0, mem::MEM_RELEASE);
+            }
+        }
+    }
+
     #[test]
     fn title_memory_status_reports_budget() {
         let mut s: TitleMemoryStatusT = unsafe { std::mem::zeroed() };
@@ -1999,6 +2309,64 @@ mod tests {
             fnd::SetLastError(0);
             assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut huge, &mut page), 0);
             assert_eq!(fnd::GetLastError(), fnd::ERROR_NOT_ENOUGH_MEMORY);
+        }
+    }
+
+    /// A no-access graphics reservation of 64 KiB pages is the GPU view of the CPU-readable one
+    /// of its size before it: textures there read the CPU view (`title_textures`).
+    #[test]
+    fn gpu_view_reservations_name_their_cpu_view() {
+        // (addresses far above anything Windows hands out: only the bookkeeping is tested)
+        let (a, b, size) = (0x7000_0000_0000usize, 0x7006_0000_0000usize, 0x6_0000_0000usize);
+        let other = 0x7010_0000_0000usize;
+        mirrors::reserved(a, size, 0x2040_2000, mem::PAGE_READWRITE);
+        mirrors::reserved(other, 0x1000_0000, 0x2040_2000, mem::PAGE_READWRITE); // another size
+        assert_eq!(mirrors::source(b + 0x1234_0000), None, "no GPU view yet");
+        mirrors::reserved(b, size, 0x2040_2000, 0x801);
+        assert_eq!(mirrors::source(b), Some(a));
+        assert_eq!(mirrors::source(b + 0x4524_0000), Some(a + 0x4524_0000));
+        assert_eq!(mirrors::source(b + size), None, "past its end");
+        assert_eq!(mirrors::source(a + 0x10), None, "the CPU view is no GPU view");
+        // committed memory or other protections are no GPU views
+        let c = 0x7020_0000_0000usize;
+        mirrors::reserved(c, size, 0x2040_3000, 0x801);
+        assert_eq!(mirrors::source(c), None);
+        mirrors::released(a);
+        assert_eq!(mirrors::source(b), None, "released with its CPU view");
+        mirrors::released(other);
+    }
+
+    /// GPU-visible title memory that falls back to plain memory (64 KiB pages, large pages, a
+    /// graphics protection) is write-watched: a texture placed there sees the CPU's writes.
+    #[test]
+    fn gpu_visible_fallback_memory_is_write_watched() {
+        unsafe {
+            // (MEM_64K_PAGES | MEM_RESERVE; MEM_LARGE_PAGES | MEM_RESERVE | MEM_COMMIT with a
+            // PAGE_GRAPHICS_* protection; MEM_GRAPHICS | MEM_RESERVE | MEM_COMMIT)
+            for (t, p) in [(0x2040_2000u32, mem::PAGE_READWRITE), (0x2000_3000, 0x2404), (MEM_GRAPHICS | 0x3000, mem::PAGE_READWRITE)] {
+                let size = 0x40_0000;
+                let q = VirtualAlloc(std::ptr::null(), size, t, p);
+                assert!(!q.is_null(), "flags {t:#x}");
+                let a = q as usize;
+                if crate::gpu::uma::get().is_some_and(|u| u.contains(a) || u.is_sparse(a)) {
+                    // a window had room: write-watched there (`uma::watch_regions`)
+                    VirtualFree(q, 0, mem::MEM_RELEASE);
+                    continue;
+                }
+                assert!(in_graphics_reservation(a), "flags {t:#x}: a fallback allocation is watched");
+                if t & 0x1000 == 0 {
+                    assert!(!VirtualAlloc((a + 0x2_0000) as *const c_void, 0x1_0000, 0x1000, mem::PAGE_READWRITE).is_null());
+                }
+                let mut buf = [std::ptr::null_mut::<c_void>(); 16];
+                let (mut n, mut gran) = (buf.len(), 0u32);
+                assert_eq!(mem::GetWriteWatch(1, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0);
+                ((a + 0x2_1234) as *mut u8).write_volatile(7);
+                n = buf.len();
+                assert_eq!(mem::GetWriteWatch(1, q, size, buf.as_mut_ptr(), &mut n, &mut gran), 0);
+                assert_eq!(&buf[..n], &[(a + 0x2_1000) as *mut c_void], "flags {t:#x}: the written page is reported");
+                assert_eq!(VirtualFree(q, 0, mem::MEM_RELEASE), 1);
+                assert!(!in_graphics_reservation(a));
+            }
         }
     }
 

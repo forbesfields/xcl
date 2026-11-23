@@ -674,6 +674,12 @@ pub fn pc_resource_desc(x: &[u8; 0x38]) -> [u8; 0x38] {
     if matches!(format, 86 | 115) && flags & 5 != 0 {
         d[0x20..0x24].copy_from_slice(&28u32.to_le_bytes());
     }
+    // R9G9B9E5_SHAREDEXP targets: the PC renders into the format neither as a target nor through
+    // unordered access (a retail game's 1920x1080 one on the Series S profile, flags 0x300005:
+    // E_INVALIDARG, then its assertion) – half floats hold every shared-exponent value exactly
+    if format == 67 && flags & 5 != 0 {
+        d[0x20..0x24].copy_from_slice(&10u32.to_le_bytes());
+    }
     // a depth buffer the console also lets shaders write (a retail game's: ALLOW_DEPTH_STENCIL |
     // ALLOW_UNORDERED_ACCESS): the PC refuses the pair – the depth buffer stays
     if flags & 2 != 0 {
@@ -715,6 +721,7 @@ fn depth_typeless(f: u32) -> Option<u32> {
 pub fn pc_target_format(f: u32) -> u32 {
     match f {
         86 | 115 => 28,
+        67 => 10,
         f => pc_view_format(f),
     }
 }
@@ -737,6 +744,8 @@ pub fn pc_shader_view_format(resource: u32, view: u32) -> u32 {
         (53 | 55, 0 | 53 | 55) => 56,
         // a target made R8G8B8A8 (`pc_resource_desc`)
         (28, 86 | 115) => 28,
+        // an R9G9B9E5 target made half floats
+        (10, 67) => 10,
         (_, v) => v,
     }
 }
@@ -890,11 +899,32 @@ pub(super) unsafe extern "system" fn create_placed_resource_x(this: *mut c_void,
             return hr;
         }
     }
+    // a texture the CPU fills: on the title's pages of such textures (`vram`), shared with the
+    // ones placed there before as on the console, else a committed texture of its own
+    let mut kept = if buffer { Err(String::new()) } else { super::title_textures::layout(&x) };
+    let on_pages = kept.as_ref().ok().map(|t| t.size()).filter(|_| !super::vram::gpu_owned(flags));
+    if let Some(console_bytes) = on_pages {
+        let pc = std::ptr::read_unaligned(d.as_ptr() as *const D3D12_RESOURCE_DESC);
+        if let Some(hr) = super::vram::place_title_texture(this, va as usize, &pc, state, console_bytes, riid, ppv) {
+            let res = *ppv;
+            let tex = std::mem::replace(&mut kept, Err(String::new()));
+            if tex.and_then(|t| super::title_textures::register(this, res, va as usize, t, D3D12_RESOURCE_STATES(state as i32))).is_ok() {
+                real::note_title_address(res as usize, va as usize);
+                return hr;
+            }
+            // (not kept in step: the pages are not its own – a resource of its own instead)
+            if !res.is_null() {
+                drop(windows::core::IUnknown::from_raw(res));
+            }
+            *ppv = std::ptr::null_mut();
+            kept = super::title_textures::layout(&x);
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES { Type: D3D12_HEAP_TYPE_DEFAULT, ..Default::default() };
     let hr = real::dev_create_committed_resource(this, &heap as *const _ as usize, 0, d.as_ptr() as usize, state as usize, clear as usize, riid, ppv);
     if hr >= 0 && !buffer && !(*ppv).is_null() {
         static M: AtomicU64 = AtomicU64::new(0);
-        match super::title_textures::register(this, *ppv, va as usize, &x, D3D12_RESOURCE_STATES(state as i32)) {
+        match kept.and_then(|tex| super::title_textures::register(this, *ppv, va as usize, tex, D3D12_RESOURCE_STATES(state as i32))) {
             Ok(()) => {
                 real::note_title_address(*ppv as usize, va as usize);
                 return hr;
@@ -1049,6 +1079,12 @@ mod tests {
         x[0x20] = 86; // B5G5R5A1 target that is also a UAV
         x[0x30..0x34].copy_from_slice(&0x5u32.to_le_bytes());
         assert_eq!(desc(&x), (28, 0x5));
+        x[0x20] = 67; // R9G9B9E5 target that is also a UAV (and console bits): half floats
+        x[0x30..0x34].copy_from_slice(&0x30_0005u32.to_le_bytes());
+        assert_eq!(desc(&x), (10, 0x5));
+        x[0x30..0x34].copy_from_slice(&0x0u32.to_le_bytes()); // a sampled one stays R9G9B9E5
+        assert_eq!(desc(&x), (67, 0));
+        assert_eq!((pc_shader_view_format(10, 67), pc_shader_view_format(67, 67), pc_target_format(67)), (10, 67, 10));
         // views: a D24S8 format or R16_UNORM of the D16S8 buffer read depth; stencil formats plane 1
         assert_eq!(pc_shader_view_format(44, 45), 46);
         assert_eq!(pc_shader_view_format(44, 56), 46);

@@ -389,6 +389,23 @@ pub fn resource_at(at: usize) -> Option<usize> {
     RES.lock().unwrap().as_ref()?.get(&at).copied()
 }
 
+/// A translated T# indexes the shared SRV heap even when its words were copied by the title.
+/// Find the original slot without assigning any new shared pages.
+pub fn resource_at_shared_srv(index: u32) -> Option<usize> {
+    let heaps = HEAPS.lock().unwrap();
+    let at = heaps.iter().find_map(|heap| {
+        heap.pages.iter().enumerate().find_map(|(page, &first)| {
+            let delta = index.checked_sub(first)?;
+            if first == UNMAPPED || delta % 2 != 0 || delta >= page_descriptors(heap.n, page as u32) {
+                return None;
+            }
+            let slot = page as u32 * PAGE_SLOTS + delta / 2;
+            Some(heap.shadow + (slot * SLOT) as usize)
+        })
+    })?;
+    resource_at(at)
+}
+
 pub fn write(s: &Slot, words: &[u32]) {
     let n = words.len().min(if s.sampler { 4 } else { 8 });
     unsafe { std::ptr::copy_nonoverlapping(words.as_ptr(), s.at as *mut u32, n) };

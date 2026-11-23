@@ -667,9 +667,17 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
             dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
         }
     }
+    if let Some((index, source, format)) = SOURCE_TRACE.lock().unwrap().pending.take() {
+        let d = source.GetDesc();
+        if let Some((buffer, footprint)) = readback_copy(&p.list, &source, &d) {
+            dumps.push(FrameDump { _source: source, buffer, footprint, format, tag: format!("srv{index}") });
+        } else {
+            crate::xlog_warn!("frame trace: could not record readback for shared SRV {index}");
+        }
+    }
     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
-    if due && trace_frame() {
+    if due && trace_frame() && !visible_frame_only() {
         let busiest = busiest_rt();
         let followed = FOLLOWED.lock().unwrap();
         let targets = busiest
@@ -742,12 +750,30 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
 /// n > 1: every n-th; a title loading at a few frames a second shows few)
 /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
 fn frame_dump_due() -> bool {
+    let shown = PRESENTS.load(Ordering::Relaxed);
+    if visible_frame_only() {
+        if !PRESENTX.load(Ordering::Relaxed) {
+            return false;
+        }
+        if VISIBLE_FRAME_CAPTURED.load(Ordering::Relaxed) {
+            static FOLLOW: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+            let every = *FOLLOW.get_or_init(|| std::env::var("XCL_FRAME_DUMP_FOLLOW_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(0));
+            return every > 0 && shown % every == 0;
+        }
+    }
     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
-        Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
+        Ok(v) => v.parse().ok().filter(|&n| n > 1 || (n == 1 && visible_frame_only())).unwrap_or(120),
         Err(_) => 0,
     });
-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
+    every > 0 && shown % every == 20.min(every - 1)
+}
+
+static VISIBLE_FRAME_CAPTURED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn visible_frame_only() -> bool {
+    static MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("XCL_FRAME_DUMP_VISIBLE_ONLY").is_ok_and(|v| v == "1"))
 }
 
 /// Frames shown so far.
@@ -772,6 +798,48 @@ pub struct FrameDumpSample {
 
 pub fn last_frame_dump() -> Option<FrameDumpSample> {
     LAST_FRAME_DUMP.lock().ok().and_then(|s| *s)
+}
+
+struct SourceTrace {
+    attempts: u8,
+    next: u64,
+    pending: Option<(u32, ID3D12Resource, DXGI_FORMAT)>,
+}
+
+static SOURCE_TRACE: Mutex<SourceTrace> = Mutex::new(SourceTrace { attempts: 0, next: 0, pending: None });
+
+pub(super) fn source_trace_due() -> bool {
+    let trace = SOURCE_TRACE.lock().unwrap();
+    trace.attempts < 6 && trace.pending.is_none() && presents() >= trace.next
+}
+
+/// Keep a snapshot of the resource identity behind the actual shared SRV, then copy its
+/// GPU contents on the present queue. Limit startup diagnostics to six spaced attempts.
+pub(super) unsafe fn trace_source(parameter: usize, slot: u32, words: Option<[u32; 8]>, target: usize) {
+    let mut trace = SOURCE_TRACE.lock().unwrap();
+    let n = presents();
+    if trace.attempts >= 6 || trace.pending.is_some() || n < trace.next {
+        return;
+    }
+    trace.attempts += 1;
+    trace.next = n + 120;
+    let Some(w) = words.filter(|w| w[3] >> 28 >= 8) else {
+        crate::xlog_info!("frame trace: p{parameter} slot {slot} has no texture descriptor before present {n} ({words:x?})");
+        return;
+    };
+    let index = w[0];
+    let resource = super::console_heap::resource_at_shared_srv(index).unwrap_or(0);
+    let raw = resource as *mut c_void;
+    let Some(res) = ID3D12Resource::from_raw_borrowed(&raw) else {
+        crate::xlog_info!("frame trace: p{parameter} slot {slot} uses shared SRV {index}, with no registered resource before present {n} ({w:x?})");
+        return;
+    };
+    let d = res.GetDesc();
+    crate::xlog_info!("frame trace: p{parameter} slot {slot} uses shared SRV {index}, resource {resource:#x} ({}x{}, format {}, samples {}, flags {:#x}) before present {n}, target {target:#x}", d.Width, d.Height, d.Format.0, d.SampleDesc.Count, d.Flags.0);
+    let format = swap_format(d.Format).unwrap_or(d.Format);
+    if resource != target && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D && d.SampleDesc.Count == 1 && rgb(format, 0).is_some() {
+        trace.pending = Some((index, res.clone(), format));
+    }
 }
 
 /// a copy of subresource 0 of `src` into a new readback buffer, recorded on `list`
@@ -927,6 +995,10 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     rb.Unmap(0, None);
     let n = PRESENTS.load(Ordering::Relaxed);
+    let finding_visible = tag == "frame" && visible_frame_only() && !VISIBLE_FRAME_CAPTURED.load(Ordering::Relaxed);
+    if finding_visible && lit == 0 {
+        return;
+    }
     // `XCL_TRACE_FRAME` also dumps intermediate targets; only the presented image belongs here.
     if tag == "frame" {
         if let Ok(mut last) = LAST_FRAME_DUMP.lock() {
@@ -943,7 +1015,13 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
     }
     let Some(boot) = crate::state::boot() else { return };
     let path = boot.logs_dir().join(format!("{tag}_{n}.bmp"));
-    let _ = std::fs::write(&path, &bmp);
+    if let Err(error) = std::fs::write(&path, &bmp) {
+        crate::xlog_warn!("present: could not save {}: {error}", path.display());
+        return;
+    }
+    if finding_visible {
+        VISIBLE_FRAME_CAPTURED.store(true, Ordering::Relaxed);
+    }
     crate::xlog_info!(
         "present: {tag} {n} ({w}x{h}, format {}) written to {} – {lit} of {} samples not black{}",
         format.0,

@@ -1765,7 +1765,10 @@ unsafe extern "system" fn dev_create_cbv_x(this: *mut c_void, desc: *const D3D12
         note_buffer_view();
     }
     let (va, size) = if in_uma { (va, size) } else { (0, 0) };
-    super::console_heap::write(&slot, &crate::gpu::desc::buffer_words(va, 0, size, 22));
+    static RECORDS_16: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let records = *RECORDS_16.get_or_init(|| std::env::var("XCL_CBV_RECORDS_16").is_ok_and(|v| v == "1"));
+    let (stride, count) = if records && size.is_multiple_of(16) { (16, size / 16) } else { (0, size) };
+    super::console_heap::write(&slot, &crate::gpu::desc::buffer_words(va, stride, count, 22));
 }
 
 /// #22 CreateSampler: the PC sampler at the slot's index, the S# in XCL ABI form (word 3

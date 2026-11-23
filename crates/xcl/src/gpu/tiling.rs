@@ -396,13 +396,58 @@ impl Chain {
     /// bytes past the end of `src` read as 0
     pub fn detile_level(&self, src: &[u8], i: usize, slice: usize) -> Vec<u8> {
         let l = self.levels[i];
-        let e = 1usize << self.layout.elem_log2;
-        let mut out = vec![0u8; l.width * l.height * e];
-        for y in 0..l.height {
-            for x in 0..l.width {
-                let o = self.element_at(&l, x, y, slice);
-                if let Some(s) = src.get(o..o + e) {
-                    out[(y * l.width + x) * e..][..e].copy_from_slice(s);
+        let layout = &self.layout;
+        let e = 1usize << layout.elem_log2;
+        let row_bytes = l.width * e;
+        let mut out = vec![0u8; row_bytes * l.height];
+        if row_bytes == 0 {
+            return out;
+        }
+        if layout.mode == 0 && layout.base_xor == 0 {
+            let pitch = l.pitch * e;
+            let start = l.offset + l.origin.1 * pitch + l.origin.0 * e;
+            for (y, row) in out.chunks_exact_mut(row_bytes).enumerate() {
+                let at = start + y * pitch;
+                if let Some(src) = src.get(at..) {
+                    // Copy whole elements only, like the tiled path at a truncated edge.
+                    let n = src.len().min(row_bytes) & !(e - 1);
+                    row[..n].copy_from_slice(&src[..n]);
+                }
+            }
+            return out;
+        }
+
+        // The block address is a sum of row and column terms, and the offset
+        // inside it is an XOR of the coordinates. Divide per row or column
+        // rather than per element when repeatedly uploading a video plane.
+        let pitch_blocks = l.pitch.div_ceil(layout.block_w);
+        let z_xor = layout.oz[slice % layout.block_d] as usize
+            ^ layout.hz[(slice / layout.block_d) % layout.hz.len()] as usize
+            ^ layout.base_xor;
+        let cols: Vec<_> = (l.origin.0..l.origin.0 + l.width)
+            .map(|x| {
+                let block = x / layout.block_w;
+                let xor = layout.ox[x % layout.block_w] ^ layout.hx[block % layout.hx.len()];
+                (block * layout.block_bytes, xor as usize)
+            })
+            .collect();
+        for (y, row) in out.chunks_exact_mut(row_bytes).enumerate() {
+            let y = y + l.origin.1;
+            let block = y / layout.block_h;
+            let base = l.offset + block * pitch_blocks * layout.block_bytes;
+            let xor = z_xor ^ (layout.oy[y % layout.block_h] ^ layout.hy[block % layout.hy.len()]) as usize;
+            if e == 1 {
+                for (to, &(col, bits)) in row.iter_mut().zip(&cols) {
+                    if let Some(&value) = src.get(base + col + (xor ^ bits)) {
+                        *to = value;
+                    }
+                }
+            } else {
+                for (to, &(col, bits)) in row.chunks_exact_mut(e).zip(&cols) {
+                    let at = base + col + (xor ^ bits);
+                    if let Some(from) = src.get(at..at + e) {
+                        to.copy_from_slice(from);
+                    }
                 }
             }
         }
@@ -627,6 +672,37 @@ mod tests {
         assert_eq!(l.size(w, h), 65536); // 33 block rows fit one 64×64 tile
         assert_eq!(element(56), Some((2, 1)));
         assert_eq!(element(72), None);
+    }
+
+    #[test]
+    fn detile_level_matches_element_offsets_at_edges_and_in_mip_tails() {
+        let cfg = PipeConfig { pipes_log2: 4, pkrs_log2: 2 };
+        for mode in [0, 1, 2, 5, 6, 9, 10, 17, 18, 21, 22, 24, 25, 26, 27] {
+            for elem_log2 in 0..=4 {
+                let mut layout = Layout::new(mode, elem_log2, cfg).unwrap();
+                let elem = 1 << elem_log2;
+                if is_xor(mode) {
+                    layout.base_xor = 7 * elem;
+                }
+                let chain = Chain::new(layout, 279, 145, 1, 6);
+                let bytes: Vec<_> = (0..chain.slice_bytes).map(|x| (x * 13 ^ (x >> 8)) as u8).collect();
+                for (i, level) in chain.levels.iter().enumerate() {
+                    for (slice, src) in [(0, &bytes[..]), (3, &bytes[..bytes.len() / 2 + 1])] {
+                        let mut expected = vec![0; level.width * level.height * elem];
+                        for y in 0..level.height {
+                            for x in 0..level.width {
+                                let at = chain.element_at(level, x, y, slice);
+                                if let Some(data) = src.get(at..at + elem) {
+                                    let to = (y * level.width + x) * elem;
+                                    expected[to..to + elem].copy_from_slice(data);
+                                }
+                            }
+                        }
+                        assert_eq!(chain.detile_level(src, i, slice), expected, "mode {mode}, element {elem}, mip {i}, slice {slice}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

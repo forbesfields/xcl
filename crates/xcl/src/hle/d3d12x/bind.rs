@@ -557,6 +557,7 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
     trace_draw_kinds(this, pso);
     trace_reads_of_watched(this, pso);
     follow_layer_sources(this);
+    trace_present_source(this, pso);
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     // `XCL_TRACE_MANY=n`: n draws instead of 24 (a whole frame of a UI)
     static CAP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
@@ -588,6 +589,30 @@ unsafe fn trace_ui_draw(this: *mut c_void, pso: usize) {
             super::list_x::geometry_summary(this, args)
         );
     }
+}
+
+/// `XCL_TRACE_SOURCE=root,slot` samples one root table's texture from the selected shaders.
+unsafe fn trace_present_source(this: *mut c_void, pso: usize) {
+    static SLOT: std::sync::OnceLock<Option<(usize, u32)>> = std::sync::OnceLock::new();
+    let Some(&(parameter, slot)) = SLOT.get_or_init(|| {
+        let value = std::env::var("XCL_TRACE_SOURCE").ok()?;
+        let (p, s) = value.split_once(',')?;
+        Some((p.trim().parse().ok()?, s.trim().parse().ok()?))
+    }).as_ref() else { return };
+    if !super::present::source_trace_due() {
+        return;
+    }
+    let Some(rt) = super::present::rt0_resource(this as usize) else { return };
+    let wanted = traced_shaders();
+    if !super::present::is_presented(rt) || !super::real::pso_shaders(super::pso_async::resolve(pso)).is_some_and(|(v, p)| wanted.contains(&v) || wanted.contains(&p)) {
+        return;
+    }
+    let address = with(this, |s| {
+        let Param::Table { at } = *s.layout_gfx.as_ref()?.params.get(parameter)? else { return None };
+        let table = u32::from_le_bytes(s.args_gfx.get(at as usize..at as usize + 4)?.try_into().ok()?);
+        table.checked_add(slot.checked_mul(32)?)
+    });
+    super::present::trace_source(parameter, slot, address.and_then(super::console_heap::words_at), rt);
 }
 
 /// A draw's root arguments for the frame trace: constants, root buffers (their first words, as

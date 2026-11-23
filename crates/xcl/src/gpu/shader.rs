@@ -255,7 +255,7 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
         *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
     }
     drop(g);
-    if !dumps_enabled() {
+    if !dumps_enabled() && !dump_selected_shader(h) {
         let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
         crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, parts [{}]", blob.len(), kind.label(), names.join(","));
         if kind == Kind::XboxNative {
@@ -288,6 +288,18 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
 fn dumps_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
+}
+
+/// Capture specific shaders without translating the entire title's shader library again.
+fn dump_selected_shader(hash: u64) -> bool {
+    static SELECTED: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+    SELECTED.get_or_init(|| {
+        std::env::var("XCL_DUMP_SHADER_HASHES")
+            .unwrap_or_default()
+            .split(',')
+            .filter_map(|value| u64::from_str_radix(value.trim(), 16).ok())
+            .collect()
+    }).contains(&hash)
 }
 
 /// Console container without dumps: its FSSM variants and instructions accounted.

@@ -210,12 +210,55 @@ pub unsafe fn upload_batch(dev: &ID3D12Device, queue: &ID3D12CommandQueue, items
     }
     let alloc: ID3D12CommandAllocator = dev.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).map_err(err)?;
     let list: ID3D12GraphicsCommandList = dev.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &alloc, None).map_err(err)?;
-    let mut staging = Vec::with_capacity(items.len());
+    let mut layouts = Vec::with_capacity(items.len());
     let mut failed = Vec::new();
+    let mut total = 0u64;
     for (k, (res, subs, states)) in items.iter().enumerate() {
-        match record_upload_states(dev, &list, res, subs, states, states) {
-            Ok(s) => staging.push(s),
+        match upload_layout(dev, res, subs, states, states) {
+            Ok(layout) => {
+                let alignment = D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT as u64;
+                let Some(offset) = total.checked_next_multiple_of(alignment) else {
+                    return Err("texture upload batch offset overflow".into());
+                };
+                total = offset.checked_add(layout.bytes).ok_or("texture upload batch size overflow")?;
+                layouts.push((k, offset, layout));
+            }
             Err(e) => failed.push((k, e)),
+        }
+    }
+    if layouts.is_empty() {
+        return Ok(failed);
+    }
+
+    let mut p = std::ptr::null_mut();
+    let shared = buffer(dev, total).and_then(|up| {
+        up.Map(0, None, Some(&mut p)).map_err(err)?;
+        Ok(up)
+    });
+    let mut staging = Vec::new();
+    match shared {
+        Ok(up) => {
+            // A batch may contain thousands of tiny textures. Keep their rows in one upload
+            // buffer so each texture does not need a separate committed allocation.
+            for &(k, offset, ref layout) in &layouts {
+                write_upload(p.cast(), offset, &items[k].1, layout);
+            }
+            up.Unmap(0, None);
+            for (k, offset, layout) in layouts {
+                let (res, _, states) = &items[k];
+                record_upload_copies(&list, &up, res, offset, layout, states, states);
+            }
+            staging.push(up);
+        }
+        Err(_) => {
+            // Smaller allocations can still succeed under memory pressure.
+            failed.clear();
+            for (k, (res, subs, states)) in items.iter().enumerate() {
+                match record_upload_states(dev, &list, res, subs, states, states) {
+                    Ok(up) => staging.push(up),
+                    Err(e) => failed.push((k, e)),
+                }
+            }
         }
     }
     list.Close().map_err(err)?;
@@ -242,6 +285,22 @@ pub unsafe fn record_upload_states(
     before: &[D3D12_RESOURCE_STATES],
     after: &[D3D12_RESOURCE_STATES],
 ) -> Result<ID3D12Resource, String> {
+    let layout = upload_layout(dev, res, subs, before, after)?;
+    let up = buffer(dev, layout.bytes)?;
+    let mut p = std::ptr::null_mut();
+    up.Map(0, None, Some(&mut p)).map_err(err)?;
+    write_upload(p.cast(), 0, subs, &layout);
+    up.Unmap(0, None);
+    record_upload_copies(list, &up, res, 0, layout, before, after);
+    Ok(up)
+}
+
+struct UploadLayout {
+    footprints: Vec<D3D12_PLACED_SUBRESOURCE_FOOTPRINT>,
+    bytes: u64,
+}
+
+unsafe fn upload_layout(dev: &ID3D12Device, res: &ID3D12Resource, subs: &[Subresource], before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES]) -> Result<UploadLayout, String> {
     validate_subresources(subs)?;
     let rd = res.GetDesc();
     let n = subs.len();
@@ -256,6 +315,9 @@ pub unsafe fn record_upload_states(
     let mut row_bytes = vec![0u64; n];
     let mut total = 0u64;
     dev.GetCopyableFootprints(&rd, 0, n as u32, 0, Some(fps.as_mut_ptr()), Some(rows.as_mut_ptr()), Some(row_bytes.as_mut_ptr()), Some(&mut total));
+    if total == u64::MAX {
+        return Err("invalid texture upload footprint".into());
+    }
     for (i, ((s, fp), (&nrows, &nbytes))) in subs.iter().zip(&fps).zip(rows.iter().zip(&row_bytes)).enumerate() {
         if s.rows != nrows as usize || s.depth != fp.Footprint.Depth as usize || s.row_bytes != nbytes as usize {
             return Err(format!(
@@ -264,40 +326,43 @@ pub unsafe fn record_upload_states(
             ));
         }
     }
-    let up = buffer(dev, total)?;
-    let mut p = std::ptr::null_mut();
-    up.Map(0, None, Some(&mut p)).map_err(err)?;
-    for ((s, fp), &nrows) in subs.iter().zip(&fps).zip(&rows) {
+    Ok(UploadLayout { footprints: fps, bytes: total })
+}
+
+unsafe fn write_upload(p: *mut u8, offset: u64, subs: &[Subresource], layout: &UploadLayout) {
+    for (s, fp) in subs.iter().zip(&layout.footprints) {
         let pitch = fp.Footprint.RowPitch as usize;
-        let row = s.row_bytes.min(pitch);
         // depth slices are NumRows rows apart (rows of 4×4 blocks for BCn)
-        let slice_pitch = pitch * nrows as usize;
-        for z in 0..(fp.Footprint.Depth as usize).min(s.depth) {
-            for y in 0..(nrows as usize).min(s.rows) {
-                let at = fp.Offset as usize + z * slice_pitch + y * pitch;
-                std::ptr::copy_nonoverlapping(s.data[(z * s.rows + y) * s.row_bytes..].as_ptr(), (p as *mut u8).add(at), row);
+        let start = p.add((offset + fp.Offset) as usize);
+        for z in 0..s.depth {
+            for y in 0..s.rows {
+                let row = z * s.rows + y;
+                std::ptr::copy_nonoverlapping(s.data[row * s.row_bytes..].as_ptr(), start.add(row * pitch), s.row_bytes);
             }
         }
     }
-    up.Unmap(0, None);
+}
+
+unsafe fn record_upload_copies(list: &ID3D12GraphicsCommandList, up: &ID3D12Resource, res: &ID3D12Resource, offset: u64, layout: UploadLayout, before: &[D3D12_RESOURCE_STATES], after: &[D3D12_RESOURCE_STATES]) {
+    let n = layout.footprints.len();
     let to_copy = transitions(res, before, &[D3D12_RESOURCE_STATE_COPY_DEST], n);
     if !to_copy.is_empty() {
         list.ResourceBarrier(&to_copy);
     }
-    for (k, fp) in fps.iter().enumerate() {
+    for (k, mut fp) in layout.footprints.into_iter().enumerate() {
+        fp.Offset += offset;
         let dst = D3D12_TEXTURE_COPY_LOCATION {
             pResource: std::mem::transmute_copy(res),
             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: k as u32 },
         };
-        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(&up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: *fp } };
+        let src = D3D12_TEXTURE_COPY_LOCATION { pResource: std::mem::transmute_copy(up), Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT, Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { PlacedFootprint: fp } };
         list.CopyTextureRegion(&dst, 0, 0, 0, &src, None);
     }
     let back = transitions(res, &[D3D12_RESOURCE_STATE_COPY_DEST], after, n);
     if !back.is_empty() {
         list.ResourceBarrier(&back);
     }
-    Ok(up)
 }
 
 /// The transitions of `r`'s `n` subresources from `from` to `to` (each one state for all, or one
@@ -627,6 +692,38 @@ mod tests {
                 for (k, (g, w)) in got.iter().zip(&want).enumerate() {
                     assert!(g == w, "format {} {:?} mode {} subresource {k} ({} × {} rows × {} B) differs", t.format, t.ty, t.swizzle_mode, w.depth, w.rows, w.row_bytes);
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn gpu_batched_uploads_keep_distinct_mip_data_and_report_invalid_items() {
+        let Some((dev, queue)) = device() else {
+            crate::gpu::recomp::runner::skip_test("no GPU");
+            return;
+        };
+        let rgba8 = desc::gfx10_format(DXGI_FORMAT_R8G8B8A8_UNORM).unwrap();
+        let a = image(rgba8, ImageType::D2Array, 200, 72, 3, 8, 5, 0x40_0000);
+        let b = image(rgba8, ImageType::D3, 33, 17, 5, 3, 0, 0x80_0000);
+        unsafe {
+            let make = |t: &Image, mask| {
+                let (mut data, mem) = console_texture(t);
+                let res = create(&dev, &queue, t, &mem, CONSOLE_PIPES).unwrap();
+                for level in &mut data {
+                    for byte in &mut level.data {
+                        *byte ^= mask;
+                    }
+                }
+                (res, data, vec![SHADER_READ])
+            };
+            let a = make(&a, 0xA5);
+            let b = make(&b, 0x5A);
+            let invalid = (a.0.clone(), Vec::new(), vec![SHADER_READ]);
+            let items = [a, invalid, b];
+            let failed = upload_batch(&dev, &queue, &items).unwrap();
+            assert_eq!(failed.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [1]);
+            for (res, data, _) in [&items[0], &items[2]] {
+                assert_eq!(read_back(&dev, &queue, res, data), *data);
             }
         }
     }

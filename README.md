@@ -72,6 +72,25 @@ next steps:
 
 ### Media and tools
 
+Intro video textures placed in GPU-only views are uploaded from their paired
+CPU reservations, where the decoder writes the YUV planes.
+Eligible 64 KiB-aligned title textures reuse video-memory pages when the game
+streams a new texture over the same address. Set `XCL_TITLE_TEXTURE_PAGES=0`
+to use a separate allocation per texture.
+
+If a title packs constant-buffer descriptors into 16-byte records, launch it
+with the corresponding compatibility setting. For an offline run in PowerShell:
+
+```powershell
+$env:XCL_CBV_RECORDS_16 = '1'
+$env:XCL_NETWORK = '0'
+.\target\release\xcl.exe run 'D:\Game'
+```
+
+DirectStorage supports raw and zlib reads. The experimental BCPack path also
+unpacks BC1 streams with fitted lookup tables. Other BCPack modes and hardware
+swizzling still return a decompression error.
+
 | Feature | State | What it does | Verified by |
 |---|---|---|---|
 | **Video** | ✅ | the game's Bink 2 console DLL decodes its movies (720p / 1080p) on the CPU; the game's own YUV → RGB display shaders (`PS_Bink…` in its pack) translate like any other. Bink's GPU-assisted mode needs no Bink-specific support: its compute shaders ship with the game and go through the recompiler too (no game seen using it yet) | a game movie decodes frame by frame, picture checked |

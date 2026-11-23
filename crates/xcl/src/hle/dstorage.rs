@@ -24,9 +24,10 @@
 //!   then 5 more.
 //!
 //! Each queue has a worker thread: submitted requests run in order (file reads through the
-//! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
-//! the requests since the previous one, a signal sets the fence from the CPU. Methods not
-//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused.
+//! VFS like the title's own, memory copies, zlib, BCPack where `hle::bcpack` rebuilds the
+//! blocks of the mode), a status entry gets the first failure of the requests since the
+//! previous one, a signal sets the fence from the CPU. Methods not listed are logged and
+//! answer E_NOTIMPL; the other BCPack modes and the hardware swizzle are refused.
 
 #![allow(non_snake_case)]
 
@@ -131,7 +132,7 @@ fn bcpack_name(mode: u8) -> String {
     BCPACK_NAMES.get(mode as usize).map_or_else(|| format!("mode {mode}"), |n| n.to_string())
 }
 
-/// BCPack requests refused at enqueue (XCL has no BCPack decoder), by mode.
+/// BCPack requests refused at enqueue (XCL has no decoder for their mode), by mode.
 struct BcpackRefusals {
     requests: [AtomicU64; 16],
     with_zlib: [AtomicU64; 16],
@@ -197,10 +198,81 @@ pub struct BcpackStats {
 pub struct DStorageStats {
     /// BCPack requests refused (no decoder), by `DSTORAGE_BCPACK_MODE`
     pub bcpack_refused: BTreeMap<String, BcpackStats>,
+    /// BCPack requests the decoder ran on, by `DSTORAGE_BCPACK_MODE`
+    #[serde(default)]
+    pub bcpack_unpacked: BTreeMap<String, BcpackUnpackStats>,
 }
 
 pub fn stats() -> DStorageStats {
-    DStorageStats { bcpack_refused: BCPACK.stats() }
+    DStorageStats { bcpack_refused: BCPACK.stats(), bcpack_unpacked: UNPACKED.stats() }
+}
+
+/// BCPack requests that reached the decoder, by mode.
+struct BcpackUnpacked {
+    requests: [AtomicU64; 16],
+    bytes: [AtomicU64; 16],
+    failed: [AtomicU64; 16],
+}
+
+impl BcpackUnpacked {
+    const fn new() -> Self {
+        const Z: AtomicU64 = AtomicU64::new(0);
+        Self { requests: [Z; 16], bytes: [Z; 16], failed: [Z; 16] }
+    }
+
+    fn stats(&self) -> BTreeMap<String, BcpackUnpackStats> {
+        (1..16u8)
+            .filter(|&m| self.requests[m as usize].load(Ordering::Relaxed) + self.failed[m as usize].load(Ordering::Relaxed) > 0)
+            .map(|m| {
+                let i = m as usize;
+                let s = BcpackUnpackStats {
+                    requests: self.requests[i].load(Ordering::Relaxed),
+                    destination_bytes: self.bytes[i].load(Ordering::Relaxed),
+                    failed: self.failed[i].load(Ordering::Relaxed),
+                };
+                (bcpack_name(m), s)
+            })
+            .collect()
+    }
+}
+
+static UNPACKED: BcpackUnpacked = BcpackUnpacked::new();
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct BcpackUnpackStats {
+    /// requests whose blocks were rebuilt
+    pub requests: u64,
+    /// bytes of blocks rebuilt for them (counted before the write to the destination)
+    pub destination_bytes: u64,
+    /// requests whose stream the decoder did not take (they fail with E_DECOMPRESSION)
+    pub failed: u64,
+}
+
+/// The BCPack stage of a request: `packed` to the `n` bytes of blocks of its mode.
+fn bcpack_unpack(r: &Request, packed: &[u8], n: usize) -> Result<Vec<u8>, HRESULT> {
+    let bc = r.bcpack();
+    let i = bc as usize & 0xF;
+    match super::bcpack::decode(bc, packed, n) {
+        Ok(blocks) => {
+            if UNPACKED.requests[i].fetch_add(1, Ordering::Relaxed) == 0 {
+                crate::xlog_info!("DirectStorage: BCPack {}: first request unpacked ({} to {n} bytes)", bcpack_name(bc), packed.len());
+            }
+            UNPACKED.bytes[i].fetch_add(n as u64, Ordering::Relaxed);
+            Ok(blocks)
+        }
+        Err(e) => {
+            let k = UNPACKED.failed[i].fetch_add(1, Ordering::Relaxed) + 1;
+            // one warning per mode and kind of failure, then a running count
+            warn_once(
+                &format!("BCPack {} stream ({})", bcpack_name(bc), e.kind()),
+                format_args!("{e} (packed={}, dst={n}); the request fails with E_DECOMPRESSION", packed.len()),
+            );
+            if k <= 16 || k.is_power_of_two() {
+                crate::xlog_info!("DirectStorage: BCPack {} streams not unpacked so far: {k}", bcpack_name(bc));
+            }
+            Err(E_DECOMPRESSION)
+        }
+    }
 }
 
 /// Log a refused BCPack request: one warning per mode and zlib stage, then a running count on
@@ -674,20 +746,24 @@ impl Request {
                     return Err(E_DESTINATION_SIZE);
                 }
             }
-            // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse BCPack
-            // (counted and logged at enqueue, `BcpackRefusals`).
-            (true, _) => {
+            // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse the
+            // BCPack modes without a decoder (counted and logged at enqueue, `BcpackRefusals`).
+            (true, bc) => {
                 if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
+                if !super::bcpack::can_decode(bc) {
+                    return Err(E_DECOMPRESSION);
+                }
             }
-            // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
-            (false, _) => {
+            // Single-stage BCPack: `intermediate_size` must be 0, then refuse the modes without a decoder.
+            (false, bc) => {
                 if self.intermediate_size != 0 {
                     return Err(E_DESTINATION_SIZE);
                 }
-                return Err(E_DECOMPRESSION);
+                if !super::bcpack::can_decode(bc) {
+                    return Err(E_DECOMPRESSION);
+                }
             }
         }
         Ok(())
@@ -805,23 +881,31 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
         b
     };
 
-    if r.swizzle() != 0 || r.bcpack() != 0 {
+    let bc = r.bcpack();
+    if r.swizzle() != 0 || (bc != 0 && !super::bcpack::can_decode(bc)) {
         return Err(E_DECOMPRESSION);
     }
 
-    let payload: Vec<u8> = if r.zlib() {
+    // the stages in the console's order: zlib, then BCPack
+    let stage1: Vec<u8> = if r.zlib() {
         let stage1_len = if r.intermediate_size != 0 { r.intermediate_size as usize } else { n };
         let mut d = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(&src, stage1_len).map_err(|_| E_ZLIB_DATA)?;
-        if d.len() != stage1_len {
+        // zlib yields `intermediate_size` bytes; when the title names none, the destination's
+        // size, or before BCPack a stream of any size up to it. That last case is XCL's
+        // leniency, as is a BCPack stream no smaller than its blocks: the GDK documents
+        // `IntermediateSize` as the size of the stream BCPack reads, and what the console does
+        // with a request that leaves it 0 was not tested.
+        if d.len() != stage1_len && (bc == 0 || r.intermediate_size != 0) {
             return Err(E_ZLIB_DATA);
         }
-        if d.len() < n {
+        if bc == 0 && d.len() < n {
             d.resize(n, 0);
         }
         d
     } else {
         src
     };
+    let payload = if bc != 0 { bcpack_unpack(r, &stage1, n)? } else { stage1 };
 
     if r.dest_physical_pages() {
         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
@@ -1423,7 +1507,7 @@ mod tests {
         let mem = Request::parse(&request(SOURCE_MEMORY_BIT | 1, 0x1000, 64, 0x2000, 0x99, 20));
         assert_eq!((mem.offset, mem.check(true)), (0, Ok(())), "a memory source has no offset");
         assert_eq!(Request::parse(&request(1, 0x1000, 20, 0x2000, 0, 20)).check(false), Err(E_DESTINATION_SIZE));
-        assert_eq!(Request::parse(&request(3, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack");
+        assert_eq!(Request::parse(&request(15, 0x1000, 64, 0x2000, 0, 20)).check(false), Err(E_DECOMPRESSION), "BCPack BC7");
         assert_eq!(Request::parse(&request(0, 0, 64, 0x2000, 0, 64)).check(false), Err(E_ACCESS_VIOLATION));
     }
 
@@ -1648,12 +1732,15 @@ mod tests {
         // Zlib only with invalid intermediate_size (<= src or > dst)
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 128, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT, 0x1000, 0, 64, 0x2000, 0, 20, 96, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Two-stage zlib + BCPack: valid sizes -> E_DECOMPRESSION, invalid intermediate -> E_DESTINATION_SIZE
-        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
+        // Two-stage zlib + BCPack: valid sizes -> E_DECOMPRESSION without a decoder for the mode, invalid intermediate -> E_DESTINATION_SIZE
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DECOMPRESSION));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Ok(()));
+        assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc1, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 256, 0x2000, 0, 20, 20, 0)).check(false), Err(E_DESTINATION_SIZE));
         assert_eq!(Request::parse(&request_ex(ZLIB_BIT | bc7, 0x1000, 0, 64, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
-        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION
-        assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
+        // Single-stage BCPack: intermediate must be 0, then E_DECOMPRESSION without a decoder for the mode
+        assert_eq!(Request::parse(&request_ex(bc7, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Err(E_DECOMPRESSION));
+        assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 0, 0)).check(false), Ok(()));
         assert_eq!(Request::parse(&request_ex(bc1, 0x1000, 0, 256, 0x2000, 0, 20, 64, 0)).check(false), Err(E_DESTINATION_SIZE));
         // Hardware swizzle mode unsupported
         assert_eq!(Request::parse(&request_ex(swiz, 0x1000, 0, 64, 0x2000, 0, 64, 0, 0)).check(false), Err(E_DECOMPRESSION));
@@ -2209,19 +2296,99 @@ mod tests {
         let counts = BcpackRefusals::new();
         let bc7 = Request::parse(&request(SOURCE_MEMORY_BIT | 7 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
         let bc7_zlib = Request::parse(&request(SOURCE_MEMORY_BIT | ZLIB_BIT | 7 << BCPACK_SHIFT, 0x1000, 0x10000, 0x2000, 0, 0x4000));
-        let bc1 = Request::parse(&request(SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT, 0x1000, 0x8000, 0x2000, 0, 0x1000));
-        for (i, r) in [&bc7, &bc7_zlib, &bc1, &bc7].into_iter().enumerate() {
+        let bc3 = Request::parse(&request(SOURCE_MEMORY_BIT | 3 << BCPACK_SHIFT, 0x1000, 0x8000, 0x2000, 0, 0x1000));
+        for (i, r) in [&bc7, &bc7_zlib, &bc3, &bc7].into_iter().enumerate() {
             assert_eq!(r.check(true), Err(E_DECOMPRESSION), "the request fails as before");
             assert_eq!(counts.note(r), i as u64 + 1);
         }
         let s = counts.stats();
-        assert_eq!(s.keys().collect::<Vec<_>>(), ["BC1", "BC7"]);
+        assert_eq!(s.keys().collect::<Vec<_>>(), ["BC3", "BC7"]);
         assert_eq!((s["BC7"].requests, s["BC7"].with_zlib, s["BC7"].destination_bytes), (3, 1, 0x30000));
-        assert_eq!((s["BC1"].requests, s["BC1"].with_zlib, s["BC1"].destination_bytes), (1, 0, 0x8000));
-        assert_eq!(counts.summary(), "BC1 1 (32768 bytes), BC7 3 (196608 bytes)");
-        for m in 1..=7u64 {
+        assert_eq!((s["BC3"].requests, s["BC3"].with_zlib, s["BC3"].destination_bytes), (1, 0, 0x8000));
+        assert_eq!(counts.summary(), "BC3 1 (32768 bytes), BC7 3 (196608 bytes)");
+        // every mode without a block rebuild; BC1 has one (in the tests, with their tables)
+        for m in 1..=15u64 {
             let r = Request::parse(&request(SOURCE_MEMORY_BIT | m << BCPACK_SHIFT, 0x1000, 64, 0x2000, 0, 20));
-            assert_eq!(r.check(true), Err(E_DECOMPRESSION));
+            assert_eq!(r.check(true), if m == 1 { Ok(()) } else { Err(E_DECOMPRESSION) }, "mode {m}");
+        }
+    }
+
+    /// BC1 requests through a queue: BCPack alone and after zlib, against blocks built
+    /// independently of the decoder (`tests/data/bcpack`).
+    #[test]
+    fn bcpack_bc1_requests_are_unpacked_alone_and_after_zlib() {
+        use crate::hle::bcpack::tests as fx;
+        let bc1 = SOURCE_MEMORY_BIT | 1 << BCPACK_SHIFT;
+        let small = fx::data("bc1-16-1.bin").unwrap();
+        let small_blocks = fx::data("bc1-16-1.bc1").unwrap();
+        // 64 KiB of blocks; zero padding after the stream (as in a title's files) lets zlib shrink it
+        let mut large = fx::data("bc1-8192-3.bin").unwrap();
+        large.resize(large.len() + 2048, 0);
+        let large_blocks = crate::hle::bcpack::bc1::assemble(&fx::large_fixture_symbols(1), fx::tables()).unwrap();
+        let zipped = miniz_oxide::deflate::compress_to_vec_zlib(&large, 6);
+        assert!(zipped.len() < large.len() && large_blocks.len() == 0x10000);
+        unsafe {
+            let mut f = std::ptr::null_mut();
+            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
+            let vt = *(f as *const *const usize);
+            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
+            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
+            let mut desc = [0u8; 0x18];
+            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
+            desc[8..10].copy_from_slice(&32u16.to_le_bytes());
+            desc[10] = 2;
+            let mut q = std::ptr::null_mut();
+            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
+            let mut s = std::ptr::null_mut();
+            assert_eq!(create_status(f, 8, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
+            let qv = *(q as *const *const usize);
+            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
+            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
+            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
+            let sv = *(s as *const *const usize);
+            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
+            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
+            let before = stats().bcpack_unpacked.get("BC1").cloned().unwrap_or_default();
+
+            // (options, source, destination size, intermediate size) → status, destination
+            let damaged = &small[..small.len() - 1];
+            let cases: [(u64, &[u8], usize, usize, HRESULT, Option<&[u8]>); 7] = [
+                (bc1, &small, small_blocks.len(), 0, S_OK, Some(&small_blocks)),
+                (bc1 | ZLIB_BIT, &zipped, 0x10000, large.len(), S_OK, Some(&large_blocks)),
+                (bc1 | ZLIB_BIT, &zipped, 0x10000, 0, S_OK, Some(&large_blocks)),
+                // the intermediate size is zlib's output to the byte
+                (bc1 | ZLIB_BIT, &zipped, 0x10000, large.len() + 1, E_ZLIB_DATA, None),
+                // a stream that is not whole, and one for another number of blocks
+                (bc1, damaged, small_blocks.len(), 0, E_DECOMPRESSION, None),
+                (bc1, &small, small_blocks.len() + 8, 0, E_DECOMPRESSION, None),
+                // control: the same bytes without the BCPack stage are not the blocks
+                (SOURCE_MEMORY_BIT, &small[..small_blocks.len()], small_blocks.len(), 0, S_OK, Some(&small[..small_blocks.len()])),
+            ];
+            let mut dsts: Vec<Vec<u8>> = cases.iter().map(|c| vec![0xCDu8; c.2 + 64]).collect();
+            for (i, (c, dst)) in cases.iter().zip(dsts.iter_mut()).enumerate() {
+                enqueue(q, request_ex(c.0, dst.as_mut_ptr() as u64, 0, c.2 as u32, c.1.as_ptr() as u64, 0, c.1.len() as u32, c.3 as u32, 0).as_ptr());
+                status(q, s, i as u32);
+            }
+            submit(q);
+            let t = std::time::Instant::now();
+            while !complete(s, cases.len() as u32 - 1) && t.elapsed().as_secs() < 10 {
+                std::thread::yield_now();
+            }
+            for (i, (c, dst)) in cases.iter().zip(&dsts).enumerate() {
+                assert_eq!(hresult(s, i as u32), c.4, "request {i}");
+                match c.5 {
+                    Some(want) => assert!(&dst[..c.2] == want, "request {i}: the destination has the blocks"),
+                    None => assert!(dst[..c.2].iter().all(|&b| b == 0xCD), "request {i}: a failed request writes nothing"),
+                }
+                assert!(dst[c.2..].iter().all(|&b| b == 0xCD), "request {i}: nothing past the destination size");
+            }
+            assert_ne!(small[..small_blocks.len()], small_blocks[..], "the control differs from the blocks");
+            let after = stats().bcpack_unpacked["BC1"].clone();
+            assert!(after.requests >= before.requests + 3 && after.destination_bytes >= before.destination_bytes + 0x20000 + small_blocks.len() as u64);
+            assert!(after.failed >= before.failed + 2);
+            queue_close(q);
+            queue_release(q);
+            status_release(s);
         }
     }
 
