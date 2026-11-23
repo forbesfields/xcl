@@ -23,7 +23,24 @@ next steps:
 | **Unicorn Overlord** | `SEGAofAmericaInc.Pa253b0c1Y` 1.0.0.6 | ✅ | fully playable | – |
 | **Fortnite** | `436609B6.FortniteClient` 2.0.1461.7919 | ✅ | works fully, as far as the game allows without its online services | the game itself is online-only (multiplayer servers) |
 | **XDefiant** | `Ubisoft.XDefiant-Game` 1.0.0.186 | ✅ | works fully, as far as the game allows without its servers | the game's own servers have been shut down |
-| **A newer retail game** | – | 🚧 | starts in ~4 s, runs at a steady 30 fps without a crash, shows its menus and goes on past the first one to its settings; fits a 32 GB machine (~15 GB committed in the menus) | gameplay not reached yet; its minimap mesh pipelines are refused |
+| **[new game](#new-game-progress)** | – | 🚧 | account picker, intro and loading artwork | world loading stalls under memory pressure |
+
+### new game progress
+
+**`████░░` 4 of 6 milestones verified**
+
+| Milestone | Status |
+|---|---|
+| Open the game window | Verified |
+| Render the account picker and accept input | Verified |
+| Play the intro | Verified |
+| Show loading artwork and start streaming world assets | Verified |
+| Render the first playable scene | Pending |
+| Sustain gameplay at a steady frame rate | Pending |
+
+The latest offline run (`5da11db`) rendered the account picker at about 30 FPS. Frame output stalled
+while world assets were still streaming. The memory monitor closed XCL at 26.9 GiB of private commit
+with 1.5 GiB of system commit headroom remaining.
 
 ## Highlights
 
