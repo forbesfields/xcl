@@ -255,9 +255,9 @@ impl Book {
         for i in 0..total {
             let key = if i < own {
                 Some((space, first + i * PAGE))
-            } else if space == Space::Textures && va != first {
-                // Small textures with different starting addresses can share a console page.
-                // Give their padding separate tiles, shared only across repeated placements.
+            } else if space == Space::Textures {
+                // Padding belongs to the starting address, including for textures whose console
+                // allocation has no 64 KiB page boundary at all.
                 Some((Space::TextureTail(va), i))
             } else {
                 None
@@ -285,21 +285,26 @@ impl Book {
         }
         self.users.insert(res, (used, extra));
         if tiles.len() < total {
-            self.release(res, now);
+            self.release(res, now, true);
             return None;
         }
         Some(tiles)
     }
 
     /// Resource `res` released: its pages are no longer its.
-    fn release(&mut self, res: usize, now: std::time::Instant) {
+    fn release(&mut self, res: usize, now: std::time::Instant, keep_idle: bool) {
         let Some((used, extra)) = self.users.remove(&res) else { return };
         for key in used {
             if let Some(p) = self.pages.get_mut(&key) {
                 p.users = p.users.saturating_sub(1);
                 if p.users == 0 {
-                    p.idle_since = Some(now);
-                    self.idle.push_back((key, now));
+                    if keep_idle {
+                        p.idle_since = Some(now);
+                        self.idle.push_back((key, now));
+                    } else {
+                        self.cooling.push_back((p.tile, now));
+                        self.pages.remove(&key);
+                    }
                 }
             }
         }
@@ -312,6 +317,13 @@ impl Book {
     }
 }
 
+#[derive(Clone, Copy)]
+struct TextureBinding {
+    va: usize,
+    covered: usize,
+    tiles: u32,
+}
+
 /// The title's pages of video memory for textures in its memory (see the module's comment).
 struct Pages {
     queue: ID3D12CommandQueue,
@@ -320,6 +332,7 @@ struct Pages {
     value: u64,
     pools: Vec<ID3D12Heap>,
     book: Book,
+    texture_bindings: std::collections::HashMap<usize, TextureBinding>,
     /// queue → the fence value it last waited for
     waited: std::collections::HashMap<usize, u64>,
 }
@@ -327,8 +340,8 @@ struct Pages {
 // D3D12 objects are free-threaded
 unsafe impl Send for Pages {}
 
-/// None inside: no pages on this device (not tried yet: the outer None)
-static PAGES: Mutex<Option<Option<Pages>>> = Mutex::new(None);
+/// device raw pointer → its pages (None inside: tiled tier < 2 on this device)
+static PAGES: Mutex<std::collections::BTreeMap<usize, Option<Pages>>> = Mutex::new(std::collections::BTreeMap::new());
 
 impl Pages {
     unsafe fn new(dev: &ID3D12Device) -> Option<Pages> {
@@ -342,7 +355,7 @@ impl Pages {
         let queue: ID3D12CommandQueue = dev.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC::default()).ok()?;
         let fence: ID3D12Fence = dev.CreateFence(0, D3D12_FENCE_FLAG_NONE).ok()?;
         crate::xlog_info!("D3D12.X: textures in title memory: tiled resources on 64 KiB pages of video memory, one per page of the title's");
-        Some(Pages { queue, fence, value: 0, pools: Vec::new(), book: Book::new(), waited: std::collections::HashMap::new() })
+        Some(Pages { queue, fence, value: 0, pools: Vec::new(), book: Book::new(), texture_bindings: std::collections::HashMap::new(), waited: std::collections::HashMap::new() })
     }
 
     /// A new pool heap (its index); None: no video memory.
@@ -355,8 +368,8 @@ impl Pages {
             Flags: D3D12_HEAP_FLAG_NONE,
         };
         let mut heap: Option<ID3D12Heap> = None;
-        if let Err(e) = dev.CreateHeap(&desc, &mut heap) {
-            crate::xlog_warn!("D3D12.X: no video memory for more pages of textures in title memory ({e})");
+        if let Err(e) = super::title_textures::own_work(|| dev.CreateHeap(&desc, &mut heap)) {
+            crate::xlog_warn!("D3D12.X: no video memory for more pages of title textures ({e})");
             return None;
         }
         pools.push(heap?);
@@ -391,6 +404,39 @@ impl Pages {
         self.value += 1;
         let _ = self.queue.Signal(&self.fence, self.value);
     }
+
+    /// Unmap every tile of `res` (`D3D12_TILE_RANGE_FLAG_NULL`) so its unshared tiles can return
+    /// to the pool even while the title keeps the COM object alive.
+    unsafe fn unmap(&mut self, res: &ID3D12Resource, total: u32) {
+        let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+        let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
+        let flag = D3D12_TILE_RANGE_FLAG_NULL;
+        self.queue.UpdateTileMappings(
+            res,
+            1,
+            Some(&coord),
+            Some(&region),
+            None,
+            1,
+            Some(&flag),
+            None,
+            Some(&total),
+            D3D12_TILE_MAPPING_FLAG_NONE,
+        );
+        self.value += 1;
+        let _ = self.queue.Signal(&self.fence, self.value);
+    }
+
+    unsafe fn bind(&mut self, dev: &ID3D12Device, res: &ID3D12Resource, space: Space, binding: TextureBinding) -> bool {
+        let Some(tiles) = self.book.claim(
+            space, res.as_raw() as usize, binding.va, binding.covered,
+            binding.tiles as usize, std::time::Instant::now(), &mut || Self::grow(dev, &mut self.pools),
+        ) else {
+            return false;
+        };
+        self.map(res, &tiles);
+        true
+    }
 }
 
 /// The ranges of one UpdateTileMappings call for pool heap `heap` over a resource whose overall
@@ -420,16 +466,18 @@ fn covered_pages(va: usize, bytes: usize) -> usize {
 /// own). None: it cannot be (the caller tries an arena or a resource of its own).
 #[allow(clippy::too_many_arguments)]
 unsafe fn place_on_pages(dev: &ID3D12Device, this: *mut c_void, space: Space, va: usize, desc: &D3D12_RESOURCE_DESC, state: u32, clear: *const c_void, console_bytes: Option<u64>, riid: *const windows_sys::core::GUID, ppv: *mut *mut c_void) -> Option<HRESULT> {
-    static UNALIGNED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let unaligned = va % PAGE != 0;
-    if unaligned && (space != Space::Textures || va % 4096 != 0 || !*UNALIGNED.get_or_init(|| std::env::var("XCL_UNALIGNED_TEXTURE_PAGES").is_ok_and(|v| v.trim() == "1"))) {
+    static ALIGNED_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if va % PAGE != 0
+        && (space != Space::Textures || console_bytes.is_none()
+            || *ALIGNED_ONLY.get_or_init(|| std::env::var("XCL_UNALIGNED_TEXTURE_PAGES").is_ok_and(|v| v.trim() == "0")))
+    {
         return None;
     }
     if desc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN || desc.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE1D {
         return None;
     }
     let mut g = PAGES.lock().unwrap();
-    let pages = g.get_or_insert_with(|| Pages::new(dev)).as_mut()?;
+    let pages = g.entry(dev.as_raw() as usize).or_insert_with(|| Pages::new(dev)).as_mut()?;
     // reserved textures have the PC's 64 KiB tiles
     let tiled = D3D12_RESOURCE_DESC { Layout: D3D12_TEXTURE_LAYOUT_64KB_UNDEFINED_SWIZZLE, ..*desc };
     let hr = super::real::dev_create_reserved_resource(this, &tiled as *const _ as usize, state as usize, clear as usize, riid, ppv);
@@ -451,24 +499,59 @@ unsafe fn place_on_pages(dev: &ID3D12Device, this: *mut c_void, space: Space, va
         return None;
     }
     let own = console_bytes.map_or(total as usize, |b| covered_pages(va, b as usize)).min(total as usize);
-    let Pages { book, pools, .. } = pages;
-    let Some(tiles) = book.claim(space, raw as usize, va, own, total as usize, std::time::Instant::now(), &mut || Pages::grow(dev, pools)) else {
-        // no video memory for all of it: the texture goes
+    let binding = TextureBinding { va, covered: own, tiles: total };
+    if !pages.bind(dev, res, space, binding) {
         drop(g);
         drop(windows::core::IUnknown::from_raw(raw));
         *ppv = std::ptr::null_mut();
         return None;
-    };
-    pages.map(res, &tiles);
+    }
+    if space == Space::Textures {
+        pages.texture_bindings.insert(raw as usize, binding);
+    }
     PLACED_TEXTURES.lock().unwrap().get_or_insert_with(HashSet::new).insert(raw as usize);
     Some(hr)
+}
+
+/// Unmap a superseded texture and send its unused tiles to the cooling pool.
+pub(super) unsafe fn unmap_superseded(res: &ID3D12Resource) {
+    let key = res.as_raw() as usize;
+    let mut g = PAGES.lock().unwrap();
+    for pages in g.values_mut().flatten() {
+        if let Some(binding) = pages.texture_bindings.get(&key).copied() {
+            if pages.book.users.contains_key(&key) {
+                pages.unmap(res, binding.tiles);
+                pages.book.release(key, std::time::Instant::now(), false);
+            }
+            return;
+        }
+    }
+}
+
+/// Restore the mapping of a texture uncovered by a release.
+pub(super) unsafe fn remap_if_unmapped(res: &ID3D12Resource) -> bool {
+    let mut dev: Option<ID3D12Device> = None;
+    if res.GetDevice(&mut dev).is_err() {
+        return false;
+    }
+    let Some(dev) = dev else { return false };
+    let mut g = PAGES.lock().unwrap();
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return false };
+    let key = res.as_raw() as usize;
+    let Some(binding) = pages.texture_bindings.get(&key).copied() else { return false };
+    pages.book.users.contains_key(&key) || pages.bind(&dev, res, Space::Textures, binding)
 }
 
 /// A resource released: its pages are no longer its.
 fn forget_pages(resource: usize) {
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.as_mut() else { return };
-    pages.book.release(resource, std::time::Instant::now());
+    for pages in g.values_mut().flatten() {
+        let binding = pages.texture_bindings.remove(&resource);
+        if binding.is_some() || pages.book.users.contains_key(&resource) {
+            pages.book.release(resource, std::time::Instant::now(), true);
+            return;
+        }
+    }
 }
 
 /// A texture the title placed at `va` whose texels the CPU writes (kept in step with the memory,
@@ -492,10 +575,15 @@ pub unsafe fn place_title_texture(this: *mut c_void, va: usize, desc: &D3D12_RES
     place_on_pages(dev, this, Space::Textures, va, desc, state, std::ptr::null(), Some(console_bytes), riid, ppv)
 }
 
-/// Before a title queue's work: it waits for the pages mapped since its last work.
+/// Before GPU work on `queue`: it waits for the pages mapped since its last work on that device.
 pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+    let mut dev: Option<ID3D12Device> = None;
+    if queue.GetDevice(&mut dev).is_err() {
+        return;
+    }
+    let Some(dev) = dev else { return };
     let mut g = PAGES.lock().unwrap();
-    let Some(Some(pages)) = g.as_mut() else { return };
+    let Some(Some(pages)) = g.get_mut(&(dev.as_raw() as usize)) else { return };
     let key = queue.as_raw() as usize;
     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
         let _ = queue.Wait(&pages.fence, pages.value);
@@ -503,11 +591,33 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
     }
 }
 
-/// (bytes of pages in use by targets and textures, bytes of pool heaps) – `XCL_ACTIVITY`
+#[cfg(test)]
+pub(super) static VRAM_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(super) fn page_bytes_for(device: usize) -> (usize, usize) {
+    let g = PAGES.lock().unwrap();
+    let Some(Some(p)) = g.get(&device) else { return (0, 0) };
+    (p.book.bytes(), p.pools.len() * POOL_PAGES as usize * PAGE)
+}
+
+#[cfg(test)]
+pub(super) fn texture_page_bytes_in(device: usize, addresses: std::ops::Range<usize>) -> usize {
+    let pages = PAGES.lock().unwrap();
+    let Some(Some(pages)) = pages.get(&device) else { return 0 };
+    pages.book.pages.keys().filter(|&&(space, page)| match space {
+        Space::Targets => false,
+        Space::Textures => addresses.contains(&page),
+        Space::TextureTail(va) => addresses.contains(&va),
+    }).count() * PAGE
+}
+
+/// (bytes of pages in use by tiled textures, bytes of pool heaps) – `XCL_ACTIVITY`
 pub fn page_bytes() -> (usize, usize) {
     let g = PAGES.lock().unwrap();
-    let Some(Some(p)) = g.as_ref() else { return (0, 0) };
-    (p.book.bytes(), p.pools.len() * POOL_PAGES as usize * PAGE)
+    g.values().flatten().fold((0, 0), |(used, pools), p| {
+        (used + p.book.bytes(), pools + p.pools.len() * POOL_PAGES as usize * PAGE)
+    })
 }
 
 /// Heaps of every kind of resource in one (resource heap tier 2) – else no arenas.
@@ -647,9 +757,9 @@ mod tests {
         let mut b = Book::new();
         let mut grow = heaps();
         let first = b.claim(Space::Textures, 1, va, 1, 1, t, &mut grow).unwrap();
-        b.release(1, t);
+        b.release(1, t, true);
         assert_eq!(b.claim(Space::Textures, 2, va, 1, 1, t + s(1), &mut grow).unwrap(), first, "placed again within 2 s: the same memory");
-        b.release(2, t + s(1));
+        b.release(2, t + s(1), true);
         b.sweep(t + s(2));
         assert!(b.pages.contains_key(&(Space::Textures, va)), "an older retirement cannot expire a reactivated page");
         // the page is let go at 3 s (2 s idle) and its tile cools until 5 s
@@ -753,9 +863,9 @@ mod tests {
 
             // 256 more placements at 8 addresses: video memory for 8 textures, not 256
             let used0 = local();
-            let pages0 = page_bytes().0;
+            let pages0 = page_bytes_for(dev.as_raw() as usize).0;
             let more: Vec<ID3D12Resource> = (0..256).map(|k| place_at(va + 0x100_0000 + (k % 8) * 0x10_0000).unwrap()).collect();
-            let (used, pages) = (local().saturating_sub(used0), page_bytes().0 - pages0);
+            let (used, pages) = (local().saturating_sub(used0), page_bytes_for(dev.as_raw() as usize).0 - pages0);
             println!("256 RGBA8 512x512 textures at 8 addresses: {pages} bytes of pages, {used} bytes more local video memory");
             assert!(pages <= 8 * console_bytes as usize + 256 * PAGE, "{pages} bytes of pages");
             assert!(used < 64 * console_bytes as usize, "{used} bytes of video memory");
@@ -838,6 +948,7 @@ mod tests {
     /// arenas no target uses go. Needs a hardware adapter (skips on WARP).
     #[test]
     fn d32s8_targets_take_their_own_size_of_video_memory() {
+        let _vram_guard = VRAM_TEST_LOCK.lock().unwrap();
         use windows::core::Interface;
         use windows::Win32::Graphics::Direct3D::D3D_FEATURE_LEVEL_11_0;
         use windows::Win32::Graphics::Dxgi::Common::*;

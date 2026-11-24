@@ -91,9 +91,10 @@ with 1.5 GiB of system commit headroom remaining.
 
 Intro video textures placed in GPU-only views are uploaded from their paired
 CPU reservations, where the decoder writes the YUV planes.
-Eligible 64 KiB-aligned title textures reuse video-memory pages when the game
-streams a new texture over the same address. Set `XCL_TITLE_TEXTURE_PAGES=0`
-to use a separate allocation per texture.
+Eligible title textures reuse video-memory pages even when their console addresses are
+unaligned. Superseded textures can release their unused pages and regain them when the
+newer texture is released. Set `XCL_TITLE_TEXTURE_PAGES=0` to use a separate allocation
+per texture, or `XCL_UNALIGNED_TEXTURE_PAGES=0` to share only 64 KiB-aligned textures.
 
 If a title packs constant-buffer descriptors into 16-byte records, launch it
 with the corresponding compatibility setting. For an offline run in PowerShell:
