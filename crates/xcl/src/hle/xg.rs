@@ -11,7 +11,7 @@
 //!   GetResourceSizeBytes, GetResourceBaseAlignmentBytes, GetMipLevelOffsetBytes(plane, mip),
 //!   GetTexelElementOffsetBytes(plane, mip, x, y, slice, sample, bit*), GetTexelCoordinate,
 //!   CopyIntoSubresource(dst, plane, subresource, src, row pitch, slice pitch),
-//!   CopyFromSubresource(dst, plane, subresource, src, row pitch, slice pitch), then 2 more.
+//!   CopyFromSubresource(dst, plane, subresource, arg4, src, row pitch, slice pitch), then 2 more.
 //! * XG_RESOURCE_LAYOUT (0x1B40): size @0, alignment @8, mips @0x10, planes @0x14, planes
 //!   from 0x18, 0x6C8 bytes each (usage @0, size @8, slice size @0x10, alignment @0x20, bytes
 //!   per element @0x28, first mip in the tail @0x2C, mips in the tail @0x30, then 15 mips of
@@ -695,22 +695,75 @@ unsafe extern "system" fn copy_into(p: *mut c_void, dst: *mut u8, plane: u32, su
 }
 
 /// the level's place in `src` (the whole resource) → rows of `dst` (`row_pitch` apart)
-unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, src: *const u8, row_pitch: u32, slice_pitch: u32) -> HRESULT {
+#[allow(clippy::too_many_arguments)]
+unsafe extern "system" fn copy_from(
+    p: *mut c_void, dst: *mut u8, plane: u32, sub: u32, _arg4: u32, src: *const u8, row_pitch: u32, slice_pitch: u32,
+) -> HRESULT {
+    use crate::hle::kernelx::{lazy, mirrors, writable};
+    use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
     let Some((t, at, i, k)) = subresource(tex(p), plane, sub).filter(|_| !dst.is_null() && !src.is_null()) else { return E_INVALIDARG };
     let m = t.chain.levels[i];
     let row = m.width * t.bpe as usize;
-    if t.depth > 0 {
-        let linear = t.chain.detile_volume(std::slice::from_raw_parts(src.add(at as usize), t.size() as usize), i);
-        for (n, from) in linear.chunks_exact(row).enumerate() {
-            let to = n / m.height * slice_pitch as usize + n % m.height * row_pitch as usize;
-            std::ptr::copy_nonoverlapping(from.as_ptr(), dst.add(to), row);
-        }
-        return S_OK;
+    let volume = t.depth > 0;
+    let depth = if volume { m.depth } else { 1 };
+    let row_pitch = row_pitch as usize;
+    let slice_pitch = slice_pitch as usize;
+    let Some(image_bytes) = (m.height - 1).checked_mul(row_pitch).and_then(|rows| rows.checked_add(row)) else { return E_INVALIDARG };
+    if row_pitch < row || (depth > 1 && slice_pitch < image_bytes) {
+        return E_INVALIDARG;
     }
-    let slice = std::slice::from_raw_parts(src.add(at as usize + k * t.chain.slice_bytes), t.chain.slice_bytes);
-    let linear = t.chain.detile_level(slice, i, k);
-    for y in 0..m.height {
-        std::ptr::copy_nonoverlapping(linear[y * row..].as_ptr(), dst.add(y * row_pitch as usize), row);
+    let Some(end) = (depth - 1).checked_mul(slice_pitch).and_then(|slices| slices.checked_add(image_bytes)) else { return E_INVALIDARG };
+    let mut dst = dst as usize;
+    if !writable(dst, end) {
+        let Some(cpu) = mirrors::source(dst).filter(|&cpu| writable(cpu, end)) else {
+            static REFUSED: AtomicU32 = AtomicU32::new(0);
+            let count = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+            if count.is_power_of_two() {
+                crate::xlog_warn!("XG CopyFromSubresource: destination {dst:#x} ({end:#x} bytes) is unavailable ({count} so far)");
+            }
+            return E_FAIL;
+        };
+        dst = cpu;
+    }
+    let (offset, size) = if volume {
+        (at as usize, t.size() as usize)
+    } else {
+        (at as usize + k * t.chain.slice_bytes, t.chain.slice_bytes)
+    };
+    let src = (src as usize).checked_add(offset);
+    let Some(mut src) = src else { return E_INVALIDARG };
+    if !crate::gpu::shader::readable(src, size) {
+        src = mirrors::source(src).unwrap_or(src);
+    }
+    lazy::ensure(src, size);
+    let process = GetCurrentProcess();
+    let mut tiled = vec![0u8; size];
+    let mut read = 0;
+    if ReadProcessMemory(process, src as *const c_void, tiled.as_mut_ptr().cast(), size, &mut read) == 0 || read != size {
+        return E_FAIL;
+    }
+    let linear = if volume { t.chain.detile_volume(&tiled, i) } else { t.chain.detile_level(&tiled, i, k) };
+    let write = |at, bytes: &[u8]| {
+        let mut written = 0;
+        WriteProcessMemory(process, at as *mut c_void, bytes.as_ptr().cast(), bytes.len(), &mut written) != 0 && written == bytes.len()
+    };
+    let success = if row_pitch == row && (depth == 1 || slice_pitch == row * m.height) {
+        write(dst, &linear)
+    } else {
+        linear.chunks_exact(row).enumerate().all(|(n, from)| {
+            let offset = n / m.height * slice_pitch + n % m.height * row_pitch;
+            write(dst + offset, from)
+        })
+    };
+    if !success {
+        return E_FAIL;
+    }
+    static COPIES: AtomicU32 = AtomicU32::new(0);
+    let count = COPIES.fetch_add(1, Ordering::Relaxed) + 1;
+    if count.is_power_of_two() {
+        crate::xlog_info!("XG CopyFromSubresource: copied {} rows of {row} bytes into pitch {row_pitch} ({count} so far)", m.height * depth);
     }
     S_OK
 }
@@ -718,6 +771,36 @@ unsafe extern "system" fn copy_from(p: *mut c_void, dst: *mut u8, plane: u32, su
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn copy_from_subresource_requires_writable_rows_and_keeps_pitch_padding() {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, VirtualFree, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE};
+        unsafe {
+            let d = desc(48, 2, 1, 1, 28, 1);
+            let mut computer = std::ptr::null_mut();
+            assert_eq!(XGCreateTextureComputer(d.as_ptr(), &mut computer), S_OK);
+            let mut tiled = vec![0u8; tex(computer).size() as usize];
+            let input = [0x83u8; 48 * 4 * 2];
+            assert_eq!(copy_into(computer, tiled.as_mut_ptr(), 0, 0, input.as_ptr(), 48 * 4, 0), S_OK);
+            // Call the vtable with the console ABI. The extra argument shifts the source and pitches.
+            let vtable = *(computer as *const *const usize);
+            let from: unsafe extern "system" fn(*mut c_void, *mut u8, u32, u32, u32, *const u8, u32, u32) -> HRESULT =
+                std::mem::transmute(*vtable.add(9));
+
+            let dst = VirtualAlloc(std::ptr::null(), 0x2000, MEM_RESERVE, PAGE_READWRITE).cast::<u8>();
+            assert!(!dst.is_null());
+            assert_eq!(VirtualAlloc(dst.cast(), 0x1000, MEM_COMMIT, PAGE_READWRITE), dst.cast());
+            assert_eq!(from(computer, dst, 0, 0, 0, tiled.as_ptr(), 0x1000, 0), E_FAIL);
+            assert_eq!(*dst, 0);
+            assert_eq!(VirtualAlloc(dst.add(0x1000).cast(), 0x1000, MEM_COMMIT, PAGE_READWRITE), dst.add(0x1000).cast());
+            assert_eq!(from(computer, dst, 0, 0, 0, tiled.as_ptr(), 0x1000, 0), S_OK);
+            assert_eq!(std::slice::from_raw_parts(dst, 48 * 4), &input[..48 * 4]);
+            assert_eq!(std::slice::from_raw_parts(dst.add(0x1000), 48 * 4), &input[48 * 4..]);
+            assert_eq!(*dst.add(48 * 4), 0);
+            assert_eq!(release(computer), 0);
+            VirtualFree(dst.cast(), 0, MEM_RELEASE);
+        }
+    }
 
     fn desc(width: u64, height: u32, array: u16, mips: u16, format: u32, layout: u32) -> [u8; 0x38] {
         let mut d = [0u8; 0x38];

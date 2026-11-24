@@ -41,7 +41,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use serde::{Deserialize, Serialize};
 use windows_sys::core::GUID;
 use windows_sys::Win32::Foundation::{CloseHandle, DuplicateHandle, DUPLICATE_SAME_ACCESS, HANDLE};
-use windows_sys::Win32::System::Memory::{VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT};
+use crate::hle::kernelx::writable;
 use windows_sys::Win32::System::Threading::{CreateEventW, GetCurrentProcess, ResetEvent, SetEvent};
 
 use crate::util::{HRESULT, S_OK};
@@ -786,28 +786,6 @@ unsafe fn snapshot_page_array(ptr: u64, offset: u16, byte_len: u32) -> Result<Ve
         return Err(E_ACCESS_VIOLATION);
     }
     Ok(std::slice::from_raw_parts(ptr as *const usize, count).to_vec())
-}
-
-/// Whether `n` bytes at `p` are committed, writable memory.
-fn writable(p: usize, n: usize) -> bool {
-    let Some(end) = p.checked_add(n) else { return false };
-    crate::hle::kernelx::lazy::ensure(p, n);
-    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, n)) {
-        return true;
-    }
-    let mut at = p;
-    while at < end {
-        let mut m: MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
-            return false;
-        }
-        let rw = 0x04 | 0x08 | 0x40 | 0x80; // PAGE_READWRITE / WRITECOPY / EXECUTE_READWRITE / EXECUTE_WRITECOPY
-        if m.State != MEM_COMMIT || m.Protect & rw == 0 || m.Protect & 0x100 != 0 {
-            return false;
-        }
-        at = m.BaseAddress as usize + m.RegionSize;
-    }
-    true
 }
 
 fn read_exact_at(f: &std::fs::File, offset: u64, buf: &mut [u8]) -> Result<(), HRESULT> {

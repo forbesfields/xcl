@@ -965,6 +965,28 @@ fn committed_range(a: usize, len: usize) -> bool {
     true
 }
 
+/// Whether a title buffer can be written, committing its already mapped lazy pages first.
+pub(crate) fn writable(p: usize, len: usize) -> bool {
+    let Some(end) = p.checked_add(len) else { return false };
+    lazy::ensure(p, len);
+    if crate::gpu::uma::get().is_some_and(|u| u.in_committed_window(p, len)) {
+        return true;
+    }
+    let mut at = p;
+    while at < end {
+        let mut m: mem::MEMORY_BASIC_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { mem::VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) } == 0 {
+            return false;
+        }
+        let writes = mem::PAGE_READWRITE | mem::PAGE_WRITECOPY | mem::PAGE_EXECUTE_READWRITE | mem::PAGE_EXECUTE_WRITECOPY;
+        if m.State != mem::MEM_COMMIT || m.Protect & writes == 0 || m.Protect & mem::PAGE_GUARD != 0 {
+            return false;
+        }
+        at = m.BaseAddress as usize + m.RegionSize;
+    }
+    true
+}
+
 fn committed_page(a: usize) -> bool {
     // A page in the working set is committed: asking for that is one entry, where VirtualQuery
     // walks the page table to the end of the committed range the page is in (gigabytes of
